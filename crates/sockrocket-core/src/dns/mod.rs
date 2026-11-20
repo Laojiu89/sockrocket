@@ -6,6 +6,7 @@
 //! - DNS-over-HTTPS (DoH) via standard wireformat
 //! - DNS split: route China domains to local DNS, others to remote DNS
 
+mod cn_preference;
 pub mod fakeip;
 #[cfg(test)]
 mod integration_tests;
@@ -20,8 +21,9 @@ mod runtime;
 mod upstream;
 pub use runtime::configure_bootstrap;
 pub(crate) use runtime::{
-    bootstrap_is_default, bootstrap_resolver, direct_resolver, scoped_direct_resolve,
-    scoped_resolve, with_direct_destination, with_resolver,
+    bootstrap_is_default, bootstrap_resolver, direct_destination_family, direct_resolver,
+    scoped_direct_resolve, scoped_resolve, scoped_resolve_for_family, with_direct_destination,
+    with_resolver,
 };
 pub(crate) mod wire;
 pub use wire::{
@@ -42,9 +44,18 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::proxy::connector::{BoxProxyStream, SharedOutbound, connect_upstream};
+use crate::proxy::routing::TunFamily;
 use crate::router::GeoIpDb;
 
 use self::fakeip::FakeIpPool;
+
+/// A configured route that DNS can recognize before a LAN client connects.
+#[derive(Debug, Clone)]
+pub struct DnsDomainRoute {
+    pub(crate) selector: crate::router::MatchRule,
+    /// A matching non-direct route needs a domain token in transparent mode.
+    pub(crate) preserve_identity: bool,
+}
 
 /// DNS resolver configuration.
 #[derive(Debug, Clone)]
@@ -55,6 +66,11 @@ pub struct DnsConfig {
     pub node_hosts: std::collections::HashSet<String>,
     pub client_ipv4_only: bool,
     pub dual_stack_fakeip: bool,
+    /// In default rule mode, look for a public mainland address on the direct
+    /// upstream when the primary returned only overseas addresses.
+    pub prefer_cn_answers: bool,
+    /// Active domain routes that keep their configured DNS upstreams.
+    pub domain_routes: Arc<[DnsDomainRoute]>,
     /// Explicit proxy group. None retains the historical runtime defaults.
     pub proxy_servers: Option<Vec<DnsServer>>,
     pub strategy: crate::config::dns::AddressStrategy,
@@ -85,6 +101,8 @@ impl Default for DnsConfig {
             node_hosts: Default::default(),
             client_ipv4_only: false,
             dual_stack_fakeip: false,
+            prefer_cn_answers: false,
+            domain_routes: Arc::default(),
             proxy_servers: None,
             strategy: Default::default(),
             cache_capacity: DNS_CACHE_MAX_ENTRIES,
@@ -101,6 +119,22 @@ impl Default for DnsConfig {
             cache_ttl: 0,
             cache_enabled: true,
         }
+    }
+}
+
+impl DnsConfig {
+    pub(crate) fn excludes_cn_preference(&self, canonical_domain: &str) -> bool {
+        self.domain_routes
+            .iter()
+            .any(|route| route.selector.matches_domain(canonical_domain))
+    }
+
+    /// Preserve the name when any matching route may proxy or reject it.
+    /// The router evaluates precedence later with the source, port and endpoint.
+    pub(crate) fn requires_domain_fakeip(&self, canonical_domain: &str) -> bool {
+        self.domain_routes
+            .iter()
+            .any(|route| route.preserve_identity && route.selector.matches_domain(canonical_domain))
     }
 }
 
@@ -159,7 +193,13 @@ struct CacheEntry {
 
 /// Cache by name, query type and direct-exit purpose. An overseas lookup
 /// must not satisfy a subsequent lookup through the direct DNS group.
-type CacheKey = (String, u16, bool);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum AddressPolicy {
+    Primary,
+    Direct,
+    PreferCn,
+}
+type CacheKey = (String, u16, AddressPolicy);
 type EndpointKey = (String, Vec<SocketAddr>, bool);
 type EndpointCache = LruCache<EndpointKey, (Instant, Vec<IpAddr>)>;
 
@@ -684,6 +724,15 @@ impl DnsResolver {
         domain: &str,
         qtype: u16,
     ) -> Result<Vec<IpAddr>> {
+        self.resolve_qtype_for_family(domain, qtype, None).await
+    }
+
+    pub(crate) async fn resolve_qtype_for_family(
+        &self,
+        domain: &str,
+        qtype: u16,
+        family: Option<TunFamily>,
+    ) -> Result<Vec<IpAddr>> {
         // DNS names are case-insensitive. Canonicalize before policy, cache
         // and fake-IP lookup so uppercase/trailing-dot names cannot bypass
         // the domestic group or create unrelated cache entries.
@@ -696,7 +745,23 @@ impl DnsResolver {
         {
             bail!("Invalid DNS name length");
         }
-        self.resolve_qtype_inner(&canonical, qtype).await
+        use crate::config::dns::AddressStrategy;
+        // An IPv4-only client may have been issued a Fake-A even under Ipv6Only.
+        // Mirror that wire policy only for the restored IPv4 destination.
+        if matches!(
+            (self.config.strategy, qtype),
+            (AddressStrategy::Ipv4Only, QTYPE_AAAA)
+        ) || (self.config.strategy == AddressStrategy::Ipv6Only
+            && qtype == QTYPE_A
+            && !(self.client_ipv4_only && family == Some(TunFamily::V4)))
+        {
+            return Ok(Vec::new());
+        }
+        let mut addresses = self.resolve_qtype_inner(&canonical, qtype).await?;
+        if family.is_some() {
+            addresses.retain(|ip| fakeip::fake_ipv4(*ip).is_none());
+        }
+        Ok(addresses)
     }
 
     fn hosts_answer(&self, domain: &str, qtype: u16) -> Option<Vec<IpAddr>> {
@@ -717,12 +782,12 @@ impl DnsResolver {
     /// Inner resolution path: IP-literal short-circuit, fake-IP hook,
     /// cache, dedup. See [`Self::resolve_with_qtype`] for the contract.
     async fn resolve_qtype_inner(&self, domain: &str, qtype: u16) -> Result<Vec<IpAddr>> {
-        use crate::config::dns::AddressStrategy;
-        if matches!(
-            (self.config.strategy, qtype),
-            (AddressStrategy::Ipv4Only, 28) | (AddressStrategy::Ipv6Only, 1)
-        ) {
-            return Ok(Vec::new());
+        if let Some(pool) = self.domain_identity_pool(domain, qtype) {
+            let query = build_dns_query(domain, qtype);
+            let reply = self
+                .domain_identity_reply(&query, domain, qtype, pool)
+                .await?;
+            return parse_dns_response(&reply);
         }
         let direct_pool = self
             .fakeip
@@ -742,6 +807,25 @@ impl DnsResolver {
             });
         }
 
+        let policy = if self.direct_resolution {
+            AddressPolicy::Direct
+        } else if self.can_prefer_cn(domain, qtype) {
+            AddressPolicy::PreferCn
+        } else {
+            AddressPolicy::Primary
+        };
+        if self.fakeip.is_some() && policy == AddressPolicy::PreferCn {
+            let query = build_dns_query(domain, qtype);
+            let (reply, _) = self.cn_preferred_reply(&query, domain, qtype).await?;
+            return Ok(parse_dns_response(&reply)?
+                .into_iter()
+                .filter(|ip| {
+                    (qtype == QTYPE_A && ip.is_ipv4()) || (qtype == QTYPE_AAAA && ip.is_ipv6())
+                })
+                .take(128)
+                .collect());
+        }
+
         // Fake-IP interception (transparent proxy) for Primary-group names.
         // Fallback-group (curated China suffixes / server hosts) always get
         // real addresses below. When a GeoIP DB is attached, Primary names
@@ -753,7 +837,7 @@ impl DnsResolver {
             && direct_pool.is_none()
         {
             if self.config.dual_stack_fakeip && qtype == QTYPE_AAAA {
-                let answer = self.resolve_dedup(domain, qtype).await?;
+                let answer = self.resolve_dedup(domain, qtype, policy).await?;
                 let addresses = answer.addresses;
                 return Ok(if addresses.is_empty() {
                     vec![]
@@ -777,7 +861,7 @@ impl DnsResolver {
         // Check cache — fresh hits (positive and negative) need only a read lock.
         if self.config.cache_enabled {
             let now = Instant::now();
-            let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
+            let key: CacheKey = (domain.to_string(), qtype, policy);
             let cached = {
                 let cache = self.cache.read().await;
                 cache.peek(&key).and_then(|entry| {
@@ -814,7 +898,7 @@ impl DnsResolver {
                         let domain_owned = domain.to_string();
                         tokio::spawn(async move {
                             let _slot = slot;
-                            let _ = resolver.resolve_dedup(&domain_owned, qtype).await;
+                            let _ = resolver.resolve_dedup(&domain_owned, qtype, policy).await;
                         });
                     }
                     return Ok(addrs);
@@ -823,7 +907,7 @@ impl DnsResolver {
             }
         }
 
-        let answer = self.resolve_dedup(domain, qtype).await?;
+        let answer = self.resolve_dedup(domain, qtype, policy).await?;
         if let Some(pool) = direct_pool {
             self.record_real_answers(domain, pool, &answer.addresses, answer.ttl, true);
         }
@@ -840,12 +924,15 @@ impl DnsResolver {
         // Classify the current DNS answer, not a separate timeless boolean.
         // exchange_raw retains the upstream TTL, deduplicates via resolve_dedup,
         // and refreshes expired answers before we choose real versus fake IPs.
-        let probe = self.resolve_dedup(domain, QTYPE_A).await?;
+        let probe = self
+            .resolve_dedup(domain, QTYPE_A, AddressPolicy::Primary)
+            .await?;
         if self.ips_are_cn(&probe.addresses) {
             let answer = if qtype == QTYPE_A {
                 probe
             } else {
-                self.resolve_dedup(domain, qtype).await?
+                self.resolve_dedup(domain, qtype, AddressPolicy::Primary)
+                    .await?
             };
             self.record_real_answers(domain, pool, &answer.addresses, answer.ttl, false);
             return Ok(answer.addresses);
@@ -892,8 +979,13 @@ impl DnsResolver {
     /// Resolve with in-flight dedup: concurrent resolves for the same
     /// (domain, qtype) share one upstream query. Writes the outcome
     /// (positive or negative) to the cache.
-    async fn resolve_dedup(&self, domain: &str, qtype: u16) -> Result<LookupAnswer> {
-        let key: CacheKey = (domain.to_string(), qtype, self.direct_resolution);
+    async fn resolve_dedup(
+        &self,
+        domain: &str,
+        qtype: u16,
+        policy: AddressPolicy,
+    ) -> Result<LookupAnswer> {
+        let key: CacheKey = (domain.to_string(), qtype, policy);
         let cell = {
             let mut inflight = self.inflight.lock().unwrap();
             let cell = inflight.entry(key.clone()).or_insert_with(|| {
@@ -917,7 +1009,7 @@ impl DnsResolver {
             .cell
             .reply
             .get_or_init(|| async {
-                self.resolve_uncached(domain, qtype)
+                self.resolve_uncached(domain, qtype, policy)
                     .await
                     .map_err(|e| e.to_string())
             })
@@ -952,9 +1044,20 @@ impl DnsResolver {
         result
     }
 
-    async fn resolve_uncached(&self, domain: &str, qtype: u16) -> Result<LookupAnswer> {
+    async fn resolve_uncached(
+        &self,
+        domain: &str,
+        qtype: u16,
+        policy: AddressPolicy,
+    ) -> Result<LookupAnswer> {
         let query = build_dns_query(domain, qtype);
-        let reply = self.exchange_raw(&query).await?;
+        let (reply, ttl) = if policy == AddressPolicy::PreferCn {
+            self.cn_preferred_reply(&query, domain, qtype).await?
+        } else {
+            let reply = self.exchange_raw(&query).await?;
+            let ttl = wire::answer_ttl(&reply)?;
+            (reply, ttl)
+        };
         let addresses = parse_dns_response(&reply)?
             .into_iter()
             .filter(|ip| match qtype {
@@ -964,10 +1067,7 @@ impl DnsResolver {
             })
             .take(128)
             .collect();
-        Ok(LookupAnswer {
-            addresses,
-            ttl: wire::answer_ttl(&reply)?,
-        })
+        Ok(LookupAnswer { addresses, ttl })
     }
 
     /// Resolve to first IPv4 address.
@@ -983,10 +1083,16 @@ impl DnsResolver {
     }
 
     /// Families to dial for a request with a frozen DNS policy.
-    pub(crate) fn dial_query_types(&self, tun_ipv6: bool) -> (u16, Option<u16>) {
+    pub(crate) fn dial_query_types(&self, family: Option<TunFamily>) -> (u16, Option<u16>) {
         use crate::config::dns::AddressStrategy::*;
-        if tun_ipv6 {
-            return (QTYPE_AAAA, None);
+        if let Some(family) = family {
+            return (
+                match family {
+                    TunFamily::V4 => QTYPE_A,
+                    TunFamily::V6 => QTYPE_AAAA,
+                },
+                None,
+            );
         }
         match self.config.strategy {
             Ipv4Only => (QTYPE_A, None),
@@ -998,23 +1104,36 @@ impl DnsResolver {
 
     /// Real addresses in configured order; resolution does not allocate Fake-IP.
     pub async fn resolve_addresses(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        self.resolve_addresses_for_family(domain, None).await
+    }
+
+    async fn resolve_addresses_for_family(
+        &self,
+        domain: &str,
+        family: Option<TunFamily>,
+    ) -> Result<Vec<IpAddr>> {
         let mut snapshot = self.query_snapshot();
         snapshot.fakeip = None;
-        let (a, aaaa) = tokio::join!(
-            snapshot.resolve_qtype_snapshot(domain, 1),
-            snapshot.resolve_qtype_snapshot(domain, 28)
+        let (first, other) = snapshot.dial_query_types(family);
+        let Some(other) = other else {
+            let ips = snapshot
+                .resolve_qtype_for_family(domain, first, family)
+                .await?;
+            anyhow::ensure!(
+                !ips.is_empty(),
+                "DNS returned no addresses for configured family"
+            );
+            return Ok(ips);
+        };
+        let (preferred, alternate) = tokio::join!(
+            snapshot.resolve_qtype_snapshot(domain, first),
+            snapshot.resolve_qtype_snapshot(domain, other)
         );
-        let mut ips: Vec<_> = a
+        let ips: Vec<_> = preferred
             .into_iter()
             .flatten()
-            .chain(aaaa.into_iter().flatten())
+            .chain(alternate.into_iter().flatten())
             .collect();
-        let prefer_v6 = matches!(
-            snapshot.config.strategy,
-            crate::config::dns::AddressStrategy::PreferIpv6
-                | crate::config::dns::AddressStrategy::Ipv6Only
-        );
-        ips.sort_by_key(|ip| ip.is_ipv6() != prefer_v6);
         anyhow::ensure!(
             !ips.is_empty(),
             "DNS returned no addresses for configured strategy"
@@ -1141,17 +1260,40 @@ pub fn china_domain_suffixes() -> Vec<String> {
 /// Used when system DNS would return a Sockrocket fake-IP (Merlin LAN
 /// hijack loops back into this daemon) and GeoIP needs a real address.
 pub(crate) async fn lookup_a_udp(server: SocketAddr, domain: &str) -> Option<IpAddr> {
-    let query = build_dns_query(domain, QTYPE_A);
-    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6()).ok()?;
-    socket.send_to(&query, server).await.ok()?;
-    let mut buf = [0u8; 512];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+    lookup_ips_udp(server, domain, QTYPE_A)
         .await
         .ok()?
-        .ok()?;
-    let addrs = parse_dns_response(&buf[..n]).ok()?;
-    addrs.into_iter().find(|a| a.is_ipv4())
+        .into_iter()
+        .next()
+}
+
+/// Query one nameserver directly when the system resolver only returned synthetic addresses.
+pub(crate) async fn lookup_ips_udp(
+    server: SocketAddr,
+    domain: &str,
+    qtype: u16,
+) -> Result<Vec<IpAddr>> {
+    let query = build_dns_query(domain, qtype);
+    let socket = UdpSocket::bind(if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    crate::proxy::outbound_bind::apply_to_udp_socket(&socket, server.is_ipv6())?;
+    socket.connect(server).await?;
+    socket.send(&query).await?;
+    let mut buf = [0u8; 4096];
+    let size = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf)).await??;
+    validate_response(&query, &buf[..size])?;
+    let mut ips = parse_dns_response(&buf[..size])?;
+    ips.retain(|ip| {
+        matches!(
+            (qtype, ip),
+            (QTYPE_A, IpAddr::V4(_)) | (QTYPE_AAAA, IpAddr::V6(_))
+        )
+    });
+    Ok(ips)
 }
 
 /// Create a DnsConfig with China DNS splitting.
@@ -1249,6 +1391,11 @@ pub async fn answer_raw_dns_query(resolver: &DnsResolver, query: &[u8]) -> Vec<u
 async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
     let (domain, qtype) = parse_dns_query(query)?;
     let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if let Some(pool) = resolver.domain_identity_pool(&domain, qtype) {
+        return resolver
+            .domain_identity_reply(query, &domain, qtype, pool)
+            .await;
+    }
     if let Some(addresses) = resolver.hosts_answer(&domain, qtype) {
         if let Some(pool) = &resolver.fakeip {
             resolver.record_real_answers(
@@ -1260,6 +1407,12 @@ async fn answer_wire(resolver: &DnsResolver, query: &[u8]) -> Result<Vec<u8>> {
             );
         }
         return build_dns_response_with_ttl(query, &addresses, 5);
+    }
+    if resolver.can_prefer_cn(&domain, qtype) && !cn_preference::requests_dnssec(query) {
+        return resolver
+            .cn_preferred_reply(query, &domain, qtype)
+            .await
+            .map(|(reply, _)| reply);
     }
     let Some(pool) = &resolver.fakeip else {
         return resolver.exchange_raw(query).await;
@@ -2043,7 +2196,7 @@ mod tests {
         let resolver = DnsResolver::with_config(china_split_dns_config());
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         resolver.cache.write().await.put(
-            ("stale.example.com".into(), QTYPE_A, false),
+            ("stale.example.com".into(), QTYPE_A, AddressPolicy::Primary),
             CacheEntry {
                 addresses: vec![ip],
                 expires_at: Instant::now() - Duration::from_secs(1),
