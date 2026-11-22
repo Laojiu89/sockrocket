@@ -39,23 +39,25 @@ printf 'Content-Type: application/json\\nCache-Control: no-cache\\n\\n{"ok":true
     assert not list((root/'dbus').iterdir())
 
     preview={'text':'DOMAIN,example.invalid,PROXY\n'*200,'group':'自定义'}
-    body=base64.b64encode(json.dumps(preview,ensure_ascii=False).encode()).decode()
-    for offset in range(0,len(body),2048):
-        (root/'dbus'/('sockrocket_rpc_b64_'+a)).write_text(body[offset:offset+2048])
-        subprocess.run(['sh',str(bridge),'123456','rpc_rule_part',a,str(offset)],env=env,check=True)
-        assert not (root/'bodies/batch_add_rules').exists()
-    def commit():
-        subprocess.run(['sh',str(bridge),'123456','batch_add_rules',a,str(len(body))],env=env,check=True)
-    commit()
-    assert json.loads(base64.b64decode((root/'bodies/batch_add_rules').read_bytes()))==preview
-    (root/'bodies/batch_add_rules').unlink()
-    commit()
-    assert not (root/'bodies/batch_add_rules').exists(), 'a consumed preview cannot be applied twice'
-    (root/'runtime'/('rule-body-'+a)).write_text(body[:-4])
-    commit()
-    assert not (root/'bodies/batch_add_rules').exists()
-    assert not json.loads(result.read_text())['ok']
-    assert not (root/'runtime'/('rule-body-'+a)).exists()
+    config={'config':base64.b64encode(('nodes: []\n# 测试\n'*160).encode()).decode(),'expected_revision':'saved'}
+    for action,payload in [('batch_add_rules',preview),('save_config',config)]:
+        body=base64.b64encode(json.dumps(payload,ensure_ascii=False).encode()).decode()
+        for offset in range(0,len(body),2048):
+            (root/'dbus'/('sockrocket_rpc_b64_'+a)).write_text(body[offset:offset+2048])
+            subprocess.run(['sh',str(bridge),'123456','rpc_rule_part',a,str(offset)],env=env,check=True)
+            assert not (root/'bodies'/action).exists()
+        def commit():
+            subprocess.run(['sh',str(bridge),'123456',action,a,str(len(body))],env=env,check=True)
+        commit()
+        assert json.loads(base64.b64decode((root/'bodies'/action).read_bytes()))==payload
+        (root/'bodies'/action).unlink()
+        commit()
+        assert not (root/'bodies'/action).exists(), 'a consumed preview cannot be applied twice'
+        (root/'runtime'/('rule-body-'+a)).write_text(body[:-4])
+        commit()
+        assert not (root/'bodies'/action).exists()
+        assert not json.loads(result.read_text())['ok']
+        assert not (root/'runtime'/('rule-body-'+a)).exists()
 
     for n in range(1,5):
         slot=root/'runtime'/('slot-'+str(n));slot.mkdir();(slot/'pid').write_text(str(os.getpid()))

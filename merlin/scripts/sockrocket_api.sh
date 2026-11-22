@@ -37,7 +37,7 @@ case "$ACTION" in ''|*[!a-z_]* ) respond; exit 1 ;; esac
 mkdir -p "$UPLOAD_DIR" "$RUNTIME_DIR" || exit 1
 RESULT="$UPLOAD_DIR/sockrocket_rpc_${SEQ}.json"
 BODY="$RUNTIME_DIR/rule-body-$SEQ"
-# Abandoned page loads never apply partial rules. Expire their private files.
+# Abandoned uploads never apply partial changes. Expire their private files.
 for pending in "$RUNTIME_DIR"/rule-body-*; do
     [ -f "$pending" ] || break
     # Merlin BusyBox find lacks -mmin. Skip the active transfer.
@@ -73,8 +73,8 @@ SLOT=""
 missing_body=false
 [ -n "$ARGS" ] || { missing_body=true; ARGS="{}"; }
 staged=""
-if [ "$ACTION" = batch_add_rules ] && [ -n "$4" ]; then
-    # Only one final request can claim the complete preview for this nonce.
+if { [ "$ACTION" = batch_add_rules ] || [ "$ACTION" = save_config ]; } && [ -n "$4" ]; then
+    # Only one final request can claim the complete body for this nonce.
     staged="$RUNTIME_DIR/rule-body-$SEQ.claimed.$$"
     mv "$BODY" "$staged" 2>/dev/null || :
 fi
@@ -112,7 +112,7 @@ valid_staged_body() {
 }
 if [ -n "$staged" ]; then ENCODING=base64; fi
 if [ -n "$staged" ] && ! valid_staged_body "$@"; then
-    printf '{"ok":false,"msg":"规则预览未完整传送，请保留预览并重试。"}' > "$TEMP"
+    printf '{"ok":false,"msg":"导入内容未完整传送，请保留草稿并重试。"}' > "$TEMP"
 elif [ "$ACTION" = batch_add_rules ] && [ -z "$staged" ] && [ "$missing_body" = true ]; then
     printf '{"ok":false,"msg":"规则内容未传到路由器，请刷新插件页面后重新导入。"}' > "$TEMP"
 elif [ -z "$SLOT" ]; then

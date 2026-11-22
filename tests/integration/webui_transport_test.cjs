@@ -77,21 +77,24 @@ assert.deepEqual(JSON.parse(Buffer.from(stored,'base64').toString('utf8')),paylo
 console.log('PASS: UTF-8 JSON survives Softcenter field escaping');
 
 const preview={text:'DOMAIN,edited.invalid,DIRECT\n'.repeat(185),group:'测试'};
-context.apiKscRequest('batch_add_rules',preview,()=>{});
-let staged='',packet=JSON.parse(requests.at(-1).body);
-const transfer=packet.params[1];
-while(packet.params[0]==='rpc_rule_part'){
-  assert.deepEqual(packet.params,['rpc_rule_part',transfer,String(staged.length)]);
-  const part=packet.fields['sockrocket_rpc_b64_'+transfer];
-  assert.ok(part.length>0 && part.length<=2048);
-  staged+=part;
-  requests.at(-1).reply(200,JSON.stringify({result:packet.id}));
-  packet=JSON.parse(requests.at(-1).body);
+const configBody = {config:Buffer.from('# 节点\n'.repeat(600)).toString('base64'), expected_revision:'r1'};
+for (const [action,payload] of [['batch_add_rules',preview],['save_config',configBody]]) {
+  context.apiKscRequest(action,payload,()=>{});
+  let staged='',packet=JSON.parse(requests.at(-1).body);
+  const transfer=packet.params[1];
+  while(packet.params[0]==='rpc_rule_part'){
+    assert.deepEqual(packet.params,['rpc_rule_part',transfer,String(staged.length)]);
+    const part=packet.fields['sockrocket_rpc_b64_'+transfer];
+    assert.ok(part.length>0 && part.length<=2048);
+    staged+=part;
+    requests.at(-1).reply(200,JSON.stringify({result:packet.id}));
+    packet=JSON.parse(requests.at(-1).body);
+  }
+  assert.deepEqual(JSON.parse(Buffer.from(staged,'base64').toString()),payload);
+  assert.deepEqual(packet.params,[action,transfer,String(staged.length)]);
+  assert.deepEqual(packet.fields,{});
 }
-assert.deepEqual(JSON.parse(Buffer.from(staged,'base64').toString()),preview);
-assert.deepEqual(packet.params,['batch_add_rules',transfer,String(staged.length)]);
-assert.deepEqual(packet.fields,{});
-console.log('PASS: edited URL preview is staged in order and committed once');
+console.log('PASS: rule and config requests are staged in order before commit');
 
 const configElements = {};
 const configRequests = [];
@@ -132,3 +135,55 @@ let prevented = false;
 beforeUnload({preventDefault() { prevented = true; }});
 assert.equal(prevented, true, 'unloading the page protects unsaved DNS edits');
 console.log('PASS: config read errors, no-op save, stale revisions, apply failure and DNS draft protection');
+
+async function testConfigFiles() {
+  const routerBytes = Buffer.from('\uFEFF# 节点\r\nnodes: []\r\n');
+  const notices = [];
+  let blob, downloaded, revoked;
+  const anchor = {click() { downloaded = this.download; }, remove() {}};
+  Object.assign(config, {
+    atob, Blob, TextDecoder,
+    URL: {createObjectURL(value) { blob = value; return 'blob:test'; }, revokeObjectURL(url) { revoked = url; }},
+    document: {createElement: () => anchor, body: {appendChild() {}}},
+    setTimeout: callback => callback(), srShowMsg: message => notices.push(message)
+  });
+  editor.value = 'local edits';
+  config.srDownloadConfig();
+  const [action, , reply] = configRequests.shift();
+  assert.equal(action, 'config');
+  reply({config_base64:routerBytes.toString('base64')});
+  assert.equal(downloaded, 'sockrocket-config.yaml');
+  assert.deepEqual(Buffer.from(await blob.arrayBuffer()), routerBytes);
+  assert.equal(revoked, anchor.href);
+  assert.equal(editor.value, 'local edits');
+
+  const input = {files:[blob], value:'selected'};
+  config.confirm = () => false;
+  await config.srImportConfig(input);
+  assert.equal(input.value, '');
+  assert.equal(editor.value, 'local edits');
+  config.confirm = () => true;
+  for (const file of [new Blob([]), new Blob([Uint8Array.of(0xff)]), {size:1024*1024}]) {
+    await config.srImportConfig({files:[file]});
+    assert.equal(editor.value, 'local edits');
+  }
+  assert.equal(notices.length, 3);
+  let finishRead;
+  const delayed = {size:4, arrayBuffer: () => new Promise(resolve => { finishRead = resolve; })};
+  const reading = config.srImportConfig({files:[delayed]});
+  editor.value = 'newer edits';
+  finishRead(Buffer.from('file'));
+  await reading;
+  assert.equal(editor.value, 'newer edits');
+
+  await config.srImportConfig(input);
+  assert.equal(editor.value, '# 节点\r\nnodes: []\r\n');
+  assert.equal(configRequests.length, 0);
+  config.srSaveConfig();
+  const [saveAction, body] = configRequests.shift();
+  assert.equal(saveAction, 'save_config');
+  assert.equal(body.expected_revision, 'r2');
+  assert.equal(Buffer.from(body.config, 'base64').toString(), editor.value);
+  console.log('PASS: file download, staged import, invalid files and concurrent edits');
+}
+testConfigFiles().catch(error => { console.error(error); process.exitCode = 1; });

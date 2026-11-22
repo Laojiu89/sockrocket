@@ -729,11 +729,14 @@ body.bg {min-width:0!important}
       <div class="page" id="sr-page-config" role="tabpanel" aria-labelledby="sr-nav-config">
         <div class="page-title">高级配置</div>
         <div class="toolbar">
+          <button type="button" class="btn btn-sm" id="sr-config-download" onclick="srDownloadConfig()">下载已保存配置</button>
+          <button type="button" class="btn btn-sm" id="sr-config-import" disabled onclick="srElement('config-file').click()">导入配置文件</button>
+          <input type="file" id="sr-config-file" accept=".yaml,.yml" hidden onchange="srImportConfig(this)">
           <button class="btn btn-success btn-sm" id="sr-config-save" disabled onclick="srSaveConfig()">校验并保存</button>
           <button class="btn btn-sm" onclick="srLoadConfig()">重新加载</button>
-          <span class="hint">保存前自动校验，校验失败不会覆盖当前配置。</span>
+          <span class="hint">导入 Sockrocket YAML 后可在下方核对。保存会替换整份配置，并重启正在运行的代理。</span>
         </div>
-        <div class="hint">配置包含私有订阅地址和凭据，请勿截图或直接分享。</div><div class="config-state" id="sr-config-state" role="status">等待读取配置</div><textarea id="sr-config-text" disabled aria-label="高级配置" spellcheck="false" oninput="configEdited()"></textarea>
+        <div class="hint">配置可能包含订阅地址和节点凭据，请妥善保管下载的文件。</div><div class="config-state" id="sr-config-state" role="status">等待读取配置</div><textarea id="sr-config-text" disabled aria-label="高级配置" spellcheck="false" oninput="configEdited()"></textarea>
         <div class="card" style="margin-top:12px">
           <h3>软件更新</h3>
           <div class="toolbar">
@@ -961,9 +964,9 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   // Softcenter may shell-escape JSON quotes stored in fields. Encode UTF-8
   // before dispatch so Chinese names, URLs and rule text arrive byte-for-byte.
   var encoded = utf8b64(JSON.stringify(data || {}));
-  var chunked = action === 'batch_add_rules' && encoded.length > 2048;
+  var chunked = (action === 'batch_add_rules' || action === 'save_config') && encoded.length > 2048;
   if (chunked && encoded.length > 1398104) {
-    srShowMsg('单次导入内容超过 1 MiB，请减少规则后重试。','err');
+    srShowMsg('请求内容超过 1 MiB，请缩小后重试。','err');
     if (errCb) errCb({error_code:'request_body_too_large'});
     return;
   }
@@ -1011,8 +1014,7 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
     sendPacket(job, function () { pollKscResult(seq, 0, cb, errCb, Date.now() + (timeoutMs || 80000)); });
   }
   if (!chunked) { commit(); return; }
-  // Small firmware requests stage the exact edited preview. Only the final
-  // request can apply rules, keeping the batch atomic across all chunks.
+  // Only the final request dispatches the complete body to the backend.
   job.params.push(String(encoded.length));
   function stage(offset) {
     if (offset === encoded.length) { commit(); return; }
@@ -3636,9 +3638,63 @@ function exportRules() {
 
 /* ══ Config ════════════════════════════════════════════════════════ */
 var savedConfigText = null, savedConfigRevision, configSaving = false, configReadGeneration = 0;
+function srDownloadConfig() {
+  var button = srElement('config-download');
+  if (button.disabled) return;
+  button.disabled = true;
+  function failed(d) {
+    button.disabled = false;
+    srShowMsg((d && d.msg) || '配置下载失败，请重试。', 'err');
+  }
+  srApi('config', null, function (d) {
+    if (d.ok === false || typeof d.config_base64 !== 'string') { failed(d); return; }
+    try {
+      var binary = atob(d.config_base64);
+      var bytes = Uint8Array.from(binary, function (ch) { return ch.charCodeAt(0); });
+      var url = URL.createObjectURL(new Blob([bytes], {type:'application/yaml'}));
+      var link = document.createElement('a');
+      link.href = url;
+      link.download = 'sockrocket-config.yaml';
+      document.body.appendChild(link);
+      try { link.click(); }
+      finally { link.remove(); setTimeout(function () { URL.revokeObjectURL(url); }, 1000); }
+      button.disabled = false;
+    } catch (e) { failed(); }
+  }, failed);
+}
+async function srImportConfig(input) {
+  var file = input.files[0];
+  input.value = '';
+  if (!file || savedConfigText === null || configSaving) return;
+  // The CGI cap includes both the base64 payload and its JSON envelope.
+  var envelope = JSON.stringify({config:'', expected_revision:savedConfigRevision});
+  if (4 * Math.ceil(file.size / 3) + envelope.length > 1024 * 1024) {
+    srShowMsg('文件过大，编码后的保存请求超过 1 MiB。', 'err'); return;
+  }
+  var editor = srElement('config-text'), before = editor.value;
+  var generation = ++configReadGeneration;
+  var text;
+  try {
+    var bytes = await file.arrayBuffer();
+    text = new TextDecoder('utf-8', {fatal:true}).decode(bytes);
+  } catch (e) {
+    if (generation === configReadGeneration) srShowMsg('无法读取文件，请选择 UTF-8 编码的 YAML 配置。', 'err');
+    return;
+  }
+  if (generation !== configReadGeneration) return;
+  if (!text.trim()) { srShowMsg('配置文件为空。', 'err'); return; }
+  if (editor.value !== before) { srShowMsg('读取文件期间已有新修改，请重新选择文件。', 'info'); return; }
+  if (before !== savedConfigText && !confirm('用导入文件替换编辑框中未保存的修改？')) return;
+  editor.value = text;
+  configEdited();
+  srElement('config-state').textContent = editor.value === savedConfigText
+    ? '文件内容与已加载配置相同。'
+    : '已载入 ' + file.name + '，请核对后点击「校验并保存」。';
+}
 function configEdited() {
   var dirty = srElement('config-text').value !== savedConfigText;
   srElement('config-save').disabled = configSaving || savedConfigText === null || !dirty;
+  srElement('config-import').disabled = configSaving || savedConfigText === null;
   srElement('config-state').textContent = dirty ? '有未保存的修改' : '配置已保存';
 }
 function srLoadConfig() {
@@ -3666,7 +3722,7 @@ function srSaveConfig() {
   if (text === savedConfigText) return;
   // Reads begun before this write are no longer an authoritative snapshot.
   ++configReadGeneration;
-  configSaving = true; srElement('config-save').disabled = true;
+  configSaving = true; configEdited();
   srElement('config-state').textContent = '正在校验并保存…';
   function done() { configSaving = false; configEdited(); }
   srApi('save_config', { config: utf8b64(text), expected_revision: savedConfigRevision }, function (d) {
