@@ -742,7 +742,9 @@ impl TunProxy {
                     Some(_) = streams.join_next(), if !streams.is_empty() => continue,
                     _ = health_tick.tick() => {
                         let (queued_packet_bytes, packet_queue_limit) = ip_stack.packet_queue_usage();
-                        let (tcp_states, oldest_close_secs, tcp_receive_bytes) = ip_stack.tcp_health();
+                        // ipstack TcpState order: Listen, SynReceived, Established, FinWait1,
+                        // FinWait2, Closing, TimeWait, CloseWait, LastAck, Closed.
+                        let (tcp_states, oldest_close_secs, receive_buffered_bytes) = ip_stack.tcp_health();
                         let tcp_events = ip_stack.tcp_event_counts();
                         let (tcp_payload_bytes, tcp_payload_limit) = ip_stack.tcp_payload_usage();
                         let process_memory = crate::resources::process_memory_kib();
@@ -751,7 +753,7 @@ impl TunProxy {
                             running:true, active:active_streams.load(Ordering::Relaxed), rejected:rejected_sessions,
                             packet_bytes:queued_packet_bytes, packet_limit:packet_queue_limit,
                             tcp_payload_bytes, tcp_payload_limit,
-                            receive_bytes:tcp_receive_bytes,tcp_states,oldest_close_secs,
+                            receive_buffered_bytes, tcp_states, oldest_close_secs,
                             tcp_peer_resets: tcp_events.peer_resets,
                             tcp_handshake_resets: tcp_events.handshake_resets,
                             tcp_task_errors: tcp_events.task_errors,
@@ -766,7 +768,7 @@ impl TunProxy {
                             process_highwater_kib = process_memory.map(|memory| memory.1),
                             tcp_states = ?tcp_states,
                             oldest_close_secs,
-                            tcp_receive_bytes,
+                            tcp_receive_buffered_bytes = receive_buffered_bytes,
                             tcp_peer_resets = tcp_events.peer_resets,
                             tcp_handshake_resets = tcp_events.handshake_resets,
                             tcp_task_errors = tcp_events.task_errors,
