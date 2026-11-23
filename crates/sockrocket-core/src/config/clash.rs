@@ -14,14 +14,21 @@ fn deserialize_scalar<'de, D: serde::Deserializer<'de>>(
                 serde_yaml::Value::String(s) => s,
                 serde_yaml::Value::Number(n) => n.to_string(),
                 _ => {
-                    return Err(serde::de::Error::custom(
-                        "Bandwidth must be a number or string",
-                    ));
+                    return Err(serde::de::Error::custom("Expected a number or string"));
                 }
             };
             Ok(text)
         })
         .transpose()
+}
+
+fn deserialize_port<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u16>, D::Error> {
+    deserialize_scalar(deserializer)?
+        .map(|s| s.parse::<u16>())
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
@@ -34,15 +41,12 @@ fn deserialize_bandwidth<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Clash YAML configuration top-level structure
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct ClashConfig {
     // Deserialized entry-by-entry as raw values first: one malformed proxy
     // (missing port, wrong scalar type, …) must not fail the whole import.
     #[serde(default)]
     proxies: Vec<serde_yaml::Value>,
-    #[serde(default, rename = "proxy-groups")]
-    proxy_groups: Vec<ClashProxyGroup>,
 }
 
 #[allow(dead_code)]
@@ -61,10 +65,10 @@ struct ClashProxy {
     proxy_type: String,
     server: String,
     // Optional: Hysteria2 port-hopping configs carry `ports: "a-b"` instead.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_port")]
     port: Option<u16>,
     /// Hysteria2 port-hopping range, e.g. "40001-50000".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_scalar")]
     ports: Option<String>,
     #[serde(
         rename = "hop-interval",
@@ -73,15 +77,20 @@ struct ClashProxy {
     )]
     hop_interval: Option<String>,
     // Shadowsocks fields
+    #[serde(rename = "udp-over-tcp", default)]
+    udp_over_tcp: bool,
     cipher: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_scalar")]
     password: Option<String>,
     // VMess fields
     uuid: Option<String>,
     #[serde(rename = "alterId", default)]
     alter_id: Option<u32>,
     // VLESS fields
-    encryption: Option<String>,
     flow: Option<String>,
+    encryption: Option<String>,
+    #[serde(rename = "ss-opts")]
+    trojan_ss: Option<TrojanSsOpts>,
     // TLS
     #[serde(default)]
     tls: bool,
@@ -89,6 +98,15 @@ struct ClashProxy {
     sni: Option<String>,
     #[serde(rename = "skip-cert-verify", default)]
     skip_cert_verify: bool,
+    #[serde(rename = "name-cert-verify")]
+    name_cert_verify: Option<String>,
+    certificate: Option<String>,
+    #[serde(rename = "private-key")]
+    private_key: Option<String>,
+    #[serde(rename = "ech-opts")]
+    ech_opts: Option<ClashSwitch>,
+    #[serde(rename = "realm-opts")]
+    realm_opts: Option<ClashSwitch>,
     alpn: Option<Vec<String>>,
     #[serde(rename = "client-fingerprint")]
     client_fingerprint: Option<String>,
@@ -138,12 +156,28 @@ struct ClashProxy {
     #[serde(rename = "fast-open")]
     fast_open: Option<bool>,
     obfs: Option<String>,
-    #[serde(rename = "obfs-password")]
+    #[serde(
+        rename = "obfs-password",
+        default,
+        deserialize_with = "deserialize_scalar"
+    )]
     obfs_password: Option<String>,
     #[serde(rename = "obfs-min-packet-size")]
     min_packet_size: Option<u16>,
     #[serde(rename = "obfs-max-packet-size")]
     max_packet_size: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClashSwitch {
+    #[serde(default)]
+    enable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrojanSsOpts {
+    #[serde(default)]
+    enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,16 +194,6 @@ struct ClashRealityOpts {
     public_key: Option<String>,
     #[serde(rename = "short-id")]
     short_id: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct ClashProxyGroup {
-    name: String,
-    #[serde(rename = "type")]
-    group_type: String,
-    #[serde(default)]
-    proxies: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,16 +265,20 @@ fn mieru_from_clash(value: serde_yaml::Value) -> Result<Node> {
 
 /// Parse a Clash YAML configuration string into a list of nodes
 pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
-    let config: ClashConfig =
-        serde_yaml::from_str(yaml_str).context("Failed to parse Clash YAML")?;
-
     let root = super::storage::parse_yaml_document(yaml_str)
         .map_err(|_| anyhow::anyhow!("Invalid Clash configuration"))?;
     let server_dns = super::server_dns::import(&root)?
         .map(|p| serde_json::to_string(&p))
         .transpose()?;
+    let config: ClashConfig = serde_yaml::from_value(root).context("Failed to parse Clash YAML")?;
     let mut nodes = Vec::new();
-    for value in config.proxies {
+    for mut value in config.proxies {
+        // Mihomo configurations often share TLS and authentication settings
+        // through YAML anchors. Expand each entry before checking its type.
+        if value.apply_merge().is_err() {
+            tracing::warn!("Skipping malformed proxy entry");
+            continue;
+        }
         if value.get("type").and_then(serde_yaml::Value::as_str) == Some("mieru") {
             match mieru_from_clash(value) {
                 Ok(node) => nodes.push(node),
@@ -263,6 +291,12 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
                 Ok(node) => nodes.push(node),
                 Err(_) => tracing::warn!("Skipping invalid or unsupported WireGuard entry"),
             }
+            continue;
+        }
+        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("tuic")
+            && normalize_tuic_endpoint(&mut value).is_err()
+        {
+            tracing::warn!("Skipping unsupported TUIC endpoint or TLS configuration");
             continue;
         }
         // Per-entry deserialization: a single malformed proxy is skipped
@@ -289,6 +323,42 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
         }
     }
     Ok(nodes)
+}
+
+fn normalize_tuic_endpoint(value: &mut serde_yaml::Value) -> Result<()> {
+    use serde_yaml::Value;
+    let fields = value
+        .as_mapping_mut()
+        .context("Invalid TUIC configuration")?;
+    let string = |key: &str| {
+        fields
+            .get(key)
+            .map(|v| v.as_str().context("Invalid TUIC text field"))
+            .transpose()
+    };
+    anyhow::ensure!(
+        string("token")?.unwrap_or("").is_empty(),
+        "TUIC v4 token is unsupported"
+    );
+    anyhow::ensure!(
+        fields
+            .get("disable-sni")
+            .is_none_or(|v| v.as_bool() == Some(false)),
+        "Disabling TLS SNI is not supported"
+    );
+    let server = string("server")?.context("Missing TUIC server")?;
+    let sni = string("servername")?
+        .or(string("sni")?)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(server);
+    if let Some(ip) = string("ip")?.filter(|ip| !ip.is_empty()) {
+        let endpoint: std::net::IpAddr = ip.parse().context("Invalid TUIC server IP override")?;
+        // Dial the given IP but continue to use the configured TLS identity.
+        let sni = sni.to_owned();
+        fields.insert(Value::from("server"), Value::from(endpoint.to_string()));
+        fields.insert(Value::from("servername"), Value::from(sni));
+    }
+    Ok(())
 }
 
 /// Resolve the connect port: `port` first, otherwise the first port of a
@@ -364,7 +434,9 @@ fn parse_shadow_tls_plugin(proxy: &ClashProxy) -> Result<Option<ShadowTlsConfig>
 
 /// Check if a YAML string looks like Clash config
 pub fn is_clash_config(content: &str) -> bool {
-    content.contains("proxies:") || content.contains("proxy-groups:")
+    (content.contains("proxies") || content.contains("proxy-groups"))
+        && super::storage::parse_yaml_document(content)
+            .is_ok_and(|root| root.get("proxies").is_some() || root.get("proxy-groups").is_some())
 }
 
 fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
@@ -392,6 +464,10 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             udp: proxy.udp.unwrap_or(true),
         },
         "ss" => {
+            anyhow::ensure!(
+                !proxy.udp_over_tcp,
+                "Shadowsocks UDP over TCP is unsupported"
+            );
             let cipher = proxy.cipher.as_ref().context("SS missing cipher")?.clone();
             let password = proxy
                 .password
@@ -431,6 +507,7 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         }
         "tuic" => {
             let uuid = proxy.uuid.as_ref().context("TUIC missing uuid")?.clone();
+            uuid::Uuid::parse_str(&uuid).context("Invalid TUIC v5 UUID")?;
             let password = proxy
                 .password
                 .as_ref()
@@ -458,10 +535,14 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
                             Some(v) => v,
                         }),
                 )?,
-                udp,
+                udp: proxy.udp.unwrap_or(true),
             }
         }
         "trojan" => {
+            anyhow::ensure!(
+                !proxy.trojan_ss.as_ref().is_some_and(|opts| opts.enabled),
+                "Trojan-Go Shadowsocks wrapping is unsupported"
+            );
             let password = proxy
                 .password
                 .as_ref()
@@ -470,26 +551,49 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             ProxyProtocol::Trojan { password, udp }
         }
         "hysteria2" | "hy2" => {
+            anyhow::ensure!(
+                !proxy.realm_opts.as_ref().is_some_and(|o| o.enable),
+                "Hysteria2 Realms is unsupported"
+            );
             let password = proxy
                 .password
                 .as_ref()
                 .context("Hysteria2 missing password")?
                 .clone();
-            ProxyProtocol::Hysteria2 {
-                password,
-                udp,
-                obfs: Hy2Obfs::from_parts(
-                    proxy.obfs.as_deref(),
+            let obfs = match proxy.obfs.as_deref() {
+                None | Some("") => None,
+                kind => Hy2Obfs::from_parts(
+                    kind,
                     proxy.obfs_password.as_deref(),
                     proxy.min_packet_size,
                     proxy.max_packet_size,
                 )?,
+            };
+            ProxyProtocol::Hysteria2 {
+                password,
+                udp: proxy.udp.unwrap_or(true),
+                obfs,
             }
         }
         other => anyhow::bail!("Unsupported proxy type: {}", other),
     };
 
-    let port = resolve_port(proxy)?;
+    let hopping_ports = if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
+        proxy
+            .ports
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace('/', ","))
+    } else {
+        None
+    };
+    let port = match &hopping_ports {
+        Some(ports) => super::v2ray::hysteria2_initial_port(ports, proxy.port.unwrap_or_default())?,
+        None => resolve_port(proxy)?,
+    };
+    if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
+        anyhow::ensure!(port != 0, "Hysteria2 requires a nonzero port");
+    }
     let mut extra = HashMap::new();
     if proxy.proxy_type == "ss"
         && let Some(name) = proxy.plugin.as_deref().filter(|v| *v != "shadow-tls")
@@ -556,9 +660,8 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
                 );
             }
         }
-        if let Some(ports) = &proxy.ports {
-            super::v2ray::validate_hysteria2_mport(ports, port)?;
-            extra.insert(super::v2ray::HY2_MPORT.into(), ports.clone());
+        if let Some(ports) = hopping_ports {
+            extra.insert(super::v2ray::HY2_MPORT.into(), ports);
         }
         for (value, key) in [
             (&proxy.up, super::v2ray::HY2_UP),
@@ -573,7 +676,10 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
             extra.insert(super::v2ray::HY2_FAST_OPEN.into(), value.to_string());
         }
     }
-    let transport = build_transport(proxy)?;
+    let mut transport = build_transport(proxy)?;
+    if let Some(transport) = transport.as_mut() {
+        apply_tls_requirements(proxy, transport)?;
+    }
     if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
         super::v2ray::validate_hysteria2_profile(transport.as_ref().and_then(|t| t.tls.as_ref()))?;
     }
@@ -588,6 +694,42 @@ fn convert_clash_proxy(proxy: &ClashProxy) -> Result<Node> {
         tags: vec![],
         extra,
     })
+}
+
+fn apply_tls_requirements(proxy: &ClashProxy, transport: &mut TransportConfig) -> Result<()> {
+    if transport.tls.is_none() && transport.reality.is_none() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        !proxy.ech_opts.as_ref().is_some_and(|o| o.enable),
+        "Encrypted ClientHello is unsupported"
+    );
+    anyhow::ensure!(
+        proxy.certificate.as_deref().unwrap_or("").is_empty()
+            && proxy.private_key.as_deref().unwrap_or("").is_empty(),
+        "Client certificate authentication is unsupported"
+    );
+    if let Some(name) = proxy.name_cert_verify.as_deref().filter(|s| !s.is_empty()) {
+        let sni = transport
+            .tls
+            .as_ref()
+            .and_then(|t| t.sni.as_deref())
+            .or_else(|| transport.reality.as_ref().and_then(|r| r.sni.as_deref()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&proxy.server);
+        anyhow::ensure!(
+            name.eq_ignore_ascii_case(sni),
+            "Independent certificate verification name is unsupported"
+        );
+        // Mihomo explicitly verifies this name even with skip-cert-verify set.
+        if let Some(tls) = &mut transport.tls {
+            tls.skip_cert_verify = false;
+        }
+        if let Some(reality) = &mut transport.reality {
+            reality.skip_cert_verify = false;
+        }
+    }
+    Ok(())
 }
 
 fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
@@ -643,14 +785,17 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
         }));
     }
 
-    // TUIC and Hysteria2 always use QUIC (TLS is implicit)
-    let force_tls = matches!(proxy_type, "tuic" | "hysteria2" | "hy2" | "anytls");
+    // These protocols use TLS even when the Clash entry omits the tls flag.
+    let force_tls = matches!(
+        proxy_type,
+        "trojan" | "tuic" | "hysteria2" | "hy2" | "anytls"
+    );
 
     // Reality transport
     if let Some(ref reality) = proxy.reality_opts {
         anyhow::ensure!(
-            matches!(proxy_type, "vless" | "trojan") && network == "tcp",
-            "REALITY requires VLESS or Trojan over raw TCP"
+            matches!(proxy_type, "vmess" | "vless" | "trojan") && network == "tcp",
+            "REALITY requires VMess, VLESS or Trojan over raw TCP"
         );
         let pk = reality
             .public_key
@@ -680,20 +825,14 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
         return Ok(None);
     }
 
-    let tls = if has_tls {
-        Some(TlsConfig {
-            sni: proxy.servername.clone().or_else(|| proxy.sni.clone()),
-            skip_cert_verify: proxy.skip_cert_verify,
-            alpn: proxy.alpn.clone(),
-            fingerprint: proxy.client_fingerprint.clone(),
-        })
-    } else {
-        None
-    };
-
     let ws = if has_ws {
         proxy.ws_opts.as_ref().map(|opts| {
-            let host = opts.headers.as_ref().and_then(|h| h.get("Host").cloned());
+            let host = opts.headers.as_ref().and_then(|headers| {
+                headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+                    .map(|(_, value)| value.clone())
+            });
             WsConfig {
                 path: opts.path.clone(),
                 host,
@@ -703,6 +842,33 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
     } else {
         None
     };
+
+    let tls = has_tls.then(|| {
+        // Mihomo uses the WS Host for VMess/VLESS SNI unless servername overrides it.
+        let sni = proxy
+            .servername
+            .clone()
+            .or_else(|| proxy.sni.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if !matches!(proxy_type, "vmess" | "vless") {
+                    return None;
+                }
+                let host = ws
+                    .as_ref()?
+                    .host
+                    .as_deref()?
+                    .parse::<http::uri::Authority>()
+                    .ok()?;
+                Some(host.host().trim_matches(['[', ']']).to_owned())
+            });
+        TlsConfig {
+            sni,
+            skip_cert_verify: proxy.skip_cert_verify,
+            alpn: proxy.alpn.clone(),
+            fingerprint: proxy.client_fingerprint.clone(),
+        }
+    });
 
     let transport_type = match (has_ws, has_tls) {
         _ if network == "grpc" => TransportType::Grpc,
@@ -730,6 +896,78 @@ fn build_transport(proxy: &ClashProxy) -> Result<Option<TransportConfig>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_providers_keep_supported_wire_formats_and_skip_unsupported_entries() {
+        let nodes = parse_clash_config(r#"
+proxies:
+  - {name: legacy, type: vmess, server: example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000001', alterId: 64}
+  - {name: encrypted, type: vless, server: example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000002', encryption: mlkem768x25519plus.native.1rtt.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc}
+  - {name: unknown, type: vless, server: example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000002', encryption: unknown}
+  - {name: wrapped, type: trojan, server: example.invalid, port: 443, password: fixture, ss-opts: {enabled: true}}
+  - {name: standard, type: trojan, server: example.invalid, port: 443, password: fixture, ss-opts: {enabled: false}}
+  - {name: simple-obfs, type: ss, server: example.invalid, port: 443, password: fixture, cipher: aes-256-gcm, plugin: obfs, plugin-opts: {mode: tls}}
+  - {name: websocket-mux, type: ss, server: example.invalid, port: 443, password: fixture, cipher: aes-256-gcm, plugin: v2ray-plugin, plugin-opts: {mode: websocket, mux: true}}
+"#).unwrap();
+        assert_eq!(
+            nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            [
+                "legacy",
+                "encrypted",
+                "standard",
+                "simple-obfs",
+                "websocket-mux"
+            ]
+        );
+        assert!(matches!(
+            &nodes[0].protocol,
+            ProxyProtocol::VMess { alter_id: 64, .. }
+        ));
+        assert!(
+            nodes[1]
+                .extra
+                .contains_key(super::super::v2ray::VLESS_ENCRYPTION)
+        );
+        let plugin = |i: usize| {
+            super::super::ss_plugin::Plugin::load(&nodes[i].extra)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(plugin(3).mode, "tls");
+        assert_eq!(plugin(4).mux, Some(true));
+        for node in nodes {
+            crate::create_outbound_unwarmed(&node).unwrap();
+        }
+    }
+
+    #[test]
+    fn ss2022_clash_import_preserves_the_psk_and_does_not_downgrade_uot() {
+        let yaml = r#"
+proxies:
+  - &base {name: SS2022, type: ss, server: ss.example.invalid, port: 8388, cipher: 2022-blake3-aes-128-gcm, password: 'AAECAwQFBgcICQoLDA0ODw==', udp: true}
+  - {<<: *base, name: Native, udp-over-tcp: false, udp-over-tcp-version: 2}
+  - {<<: *base, name: UoT, udp-over-tcp: true, udp-over-tcp-version: 2}
+  - {<<: *base, name: Wrapped, plugin: shadow-tls, plugin-opts: {version: 3, host: tls.example.invalid, password: synthetic-outer}}
+"#;
+        let nodes = parse_clash_config(yaml).unwrap();
+        let names: Vec<_> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["SS2022", "Native", "Wrapped"]);
+        for node in &nodes {
+            let ProxyProtocol::Shadowsocks {
+                cipher,
+                password,
+                shadow_tls,
+                ..
+            } = &node.protocol
+            else {
+                panic!("expected Shadowsocks")
+            };
+            assert_eq!(cipher, "2022-blake3-aes-128-gcm");
+            assert_eq!(password, "AAECAwQFBgcICQoLDA0ODw==");
+            assert_eq!(shadow_tls.is_some(), node.name == "Wrapped");
+            crate::create_outbound_unwarmed(node).unwrap();
+        }
+    }
 
     #[test]
     fn test_parse_clash_ss() {
@@ -818,6 +1056,44 @@ proxies:
     }
 
     #[test]
+    fn mihomo_stream_transport_fields_reach_outbound_construction() {
+        let yaml = r#"proxies:
+  - {name: vmess-ws, type: vmess, server: 192.0.2.7, port: 443, uuid: 00000000-0000-0000-0000-000000000001, alterId: 0, cipher: auto, tls: true, network: ws, ws-opts: {path: /demo, headers: {host: front.example.invalid}}, global-padding: true, authenticated-length: true}
+  - {name: vless-ws, type: vless, server: 192.0.2.7, port: 443, uuid: 00000000-0000-0000-0000-000000000001, tls: true, servername: cert.example.invalid, network: ws, ws-opts: {path: /demo, headers: {Host: front.example.invalid}}}
+  - {name: trojan-grpc, type: trojan, server: 192.0.2.7, port: 443, password: fixture, sni: cert.example.invalid, alpn: [h2], skip-cert-verify: true, client-fingerprint: chrome, network: grpc, grpc-opts: {grpc-service-name: fixture.Service}}
+  - {name: vmess-reality, type: vmess, server: 192.0.2.7, port: 443, uuid: 00000000-0000-0000-0000-000000000001, alterId: 0, cipher: auto, tls: true, servername: cert.example.invalid, client-fingerprint: chrome, reality-opts: {public-key: E27YYTzCqcRhtjR1KPPolrL0MWMOXBFMBBaU5Bak7j0, short-id: "abcd"}}
+"#;
+        let nodes = super::super::subscription::parse_subscription_content(yaml, "clash").unwrap();
+        assert_eq!(nodes.len(), 4);
+        for node in &nodes {
+            crate::create_outbound_unwarmed(node).unwrap();
+        }
+        for (node, sni) in [
+            (&nodes[0], "front.example.invalid"),
+            (&nodes[1], "cert.example.invalid"),
+        ] {
+            let t = node.transport.as_ref().unwrap();
+            assert_eq!(t.tls.as_ref().unwrap().sni.as_deref(), Some(sni));
+            assert_eq!(
+                t.ws.as_ref().unwrap().host.as_deref(),
+                Some("front.example.invalid")
+            );
+        }
+        assert_eq!(nodes[0].extra[super::super::v2ray::VMESS_PADDING], "true");
+        assert_eq!(nodes[0].extra[super::super::v2ray::VMESS_AUTH_LEN], "true");
+        let grpc = nodes[2].transport.as_ref().unwrap();
+        assert_eq!(grpc.grpc.as_ref().unwrap().service_name, "fixture.Service");
+        let tls = grpc.tls.as_ref().unwrap();
+        assert_eq!(tls.sni.as_deref(), Some("cert.example.invalid"));
+        assert_eq!(tls.fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(tls.alpn.as_ref().unwrap(), &["h2"]);
+        assert!(tls.skip_cert_verify);
+        let reality = nodes[3].transport.as_ref().unwrap();
+        assert_eq!(reality.transport_type, TransportType::Reality);
+        assert_eq!(reality.reality.as_ref().unwrap().short_id, "abcd");
+    }
+
+    #[test]
     fn test_parse_clash_tuic() {
         let yaml = r#"
 proxies:
@@ -844,6 +1120,53 @@ proxies:
                 assert_eq!(congestion_control, "bbr");
             }
             _ => panic!("Expected TUIC"),
+        }
+    }
+
+    #[test]
+    fn mihomo_tuic_dials_ip_override_with_original_tls_identity() {
+        let entry = r#"name: TUIC
+type: tuic
+server: target.example.invalid
+ip: 192.0.2.17
+port: 443
+uuid: 00000000-0000-4000-8000-000000000001
+password: fixture
+alpn: [h3]
+reduce-rtt: true
+udp-relay-mode: quic"#;
+        let import = |extra: &str| {
+            let row = format!("{entry}\n{extra}");
+            let yaml = format!("proxies:\n- {}", row.replace('\n', "\n  "));
+            parse_clash_config(&yaml).unwrap()
+        };
+        for (extra, sni) in [
+            ("", "target.example.invalid"),
+            ("sni: tls.example.invalid", "tls.example.invalid"),
+        ] {
+            let node = import(extra).pop().unwrap();
+            assert_eq!(node.server, "192.0.2.17");
+            let tls = node.transport.as_ref().unwrap().tls.as_ref().unwrap();
+            assert_eq!(tls.sni.as_deref(), Some(sni));
+            assert!(!tls.skip_cert_verify);
+            assert!(matches!(
+                node.protocol,
+                ProxyProtocol::Tuic {
+                    udp: true,
+                    relay: TuicRelay::Quic,
+                    ..
+                }
+            ));
+            assert_eq!(node.extra[super::super::v2ray::TUIC_ZERO_RTT], "true");
+            assert!(crate::create_outbound_unwarmed(&node).is_ok());
+        }
+        assert!(!import("udp: false")[0].protocol.supports_udp());
+        for extra in [
+            "disable-sni: true",
+            "token: tuic-v4",
+            "name-cert-verify: other.invalid",
+        ] {
+            assert!(import(extra).is_empty());
         }
     }
 
@@ -897,6 +1220,107 @@ proxies:
         assert_eq!(nodes[0].port, 40001);
         assert_eq!(nodes[1].name, "SS-OK");
         assert_eq!(nodes[1].port, 8388);
+    }
+
+    #[test]
+    fn mihomo_hysteria2_batch_preserves_shared_settings_and_hopping_ports() {
+        let yaml = r#"
+defaults: &hy {type: hysteria2, server: proxy.example.invalid, port: "443", password: 123456, sni: tls.example.invalid, alpn: [h3]}
+"proxies":
+  - {<<: *hy, name: hopping, ports: "35000-35002/36000,37000-37002", hop-interval: "15-30", obfs: gecko, obfs-password: 567891, obfs-min-packet-size: 512, obfs-max-packet-size: 1100}
+  - {<<: *hy, name: bad-range, ports: "9000-8000"}
+  - {<<: *hy, name: original, obfs: "", obfs-password: "", udp: false}
+  - {<<: *hy, name: obfuscated, ports: 40000, obfs: salamander, obfs-password: another-secret}
+  - {<<: true, name: bad-merge}
+  - {<<: *hy, name: invalid-port, port: 0}
+"#;
+        assert!(is_clash_config(yaml));
+        let nodes = parse_clash_config(yaml).unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].port, 35000);
+        assert_eq!(
+            nodes[0].extra[super::super::v2ray::HY2_MPORT],
+            "35000-35002,36000,37000-37002"
+        );
+        assert_eq!(
+            nodes[0].extra[super::super::v2ray::HY2_HOP_INTERVAL],
+            "15000"
+        );
+        assert_eq!(nodes[0].extra[super::super::v2ray::HY2_HOP_MAX], "30000");
+        let tls = nodes[0].transport.as_ref().unwrap().tls.as_ref().unwrap();
+        assert_eq!(tls.sni.as_deref(), Some("tls.example.invalid"));
+        assert_eq!(tls.alpn.as_ref().unwrap(), &["h3"]);
+        let ProxyProtocol::Hysteria2 {
+            password,
+            udp,
+            obfs: Some(obfs),
+        } = &nodes[0].protocol
+        else {
+            panic!("expected obfuscated HY2");
+        };
+        assert_eq!(password, "123456");
+        assert!(*udp);
+        assert_eq!(obfs.kind, "gecko");
+        assert_eq!(obfs.password, "567891");
+        assert_eq!(obfs.gecko_sizes(), (512, 1100));
+        assert_eq!(nodes[1].port, 443);
+        assert!(matches!(
+            nodes[1].protocol,
+            ProxyProtocol::Hysteria2 {
+                udp: false,
+                obfs: None,
+                ..
+            }
+        ));
+        assert_eq!(nodes[2].port, 40000);
+        assert!(
+            matches!(&nodes[2].protocol, ProxyProtocol::Hysteria2 { obfs: Some(obfs), .. } if obfs.kind == "salamander")
+        );
+        for node in nodes {
+            crate::create_outbound_unwarmed(&node).unwrap();
+        }
+    }
+
+    #[test]
+    fn clash_tls_constraints_apply_to_each_node_without_weakening_verification() {
+        let yaml = r#"
+base: &base {server: host.example.invalid, port: 443, password: fixture}
+proxies:
+  - {<<: *base, type: hysteria2, name: realm, realm-opts: {enable: true}}
+  - {<<: *base, type: hysteria2, name: ech, ech-opts: {enable: true}}
+  - {<<: *base, type: trojan, name: mtls, certificate: cert.pem, private-key: fixture.key}
+  - {<<: *base, type: anytls, name: different-name, name-cert-verify: different.example.invalid}
+  - {<<: *base, type: hysteria2, name: checked, sni: tls.example.invalid, name-cert-verify: TLS.EXAMPLE.INVALID, skip-cert-verify: true}
+  - {<<: *base, type: anytls, name: defaults, ech-opts: {enable: false, config: example}, certificate: "", private-key: "", name-cert-verify: ""}
+  - {<<: *base, type: hy2, name: basic, realm-opts: {enable: false}}
+"#;
+        let nodes = parse_clash_config(yaml).unwrap();
+        assert_eq!(
+            nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            ["checked", "defaults", "basic"]
+        );
+        assert!(
+            !nodes[0]
+                .transport
+                .as_ref()
+                .unwrap()
+                .tls
+                .as_ref()
+                .unwrap()
+                .skip_cert_verify
+        );
+    }
+
+    #[test]
+    fn clash_detection_recognizes_top_level_keys_only() {
+        assert!(is_clash_config(r#"{"proxies": [], "proxy-groups": []}"#));
+        assert!(is_clash_config("'proxies': []"));
+        assert!(!is_clash_config(
+            "hy2://auth@example.invalid:443#proxies:demo"
+        ));
+        assert!(!is_clash_config(
+            r#"{"outbounds": [], "ignored": {"proxies": []}}"#
+        ));
     }
 
     #[test]

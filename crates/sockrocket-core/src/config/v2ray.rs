@@ -490,6 +490,16 @@ pub fn parse_trojan_uri(uri: &str) -> Result<Node> {
 /// Parse any supported proxy URI
 pub fn parse_proxy_uri(uri: &str) -> Result<Node> {
     let uri = uri.trim();
+    let (scheme, rest) = uri.split_once("://").context("Missing proxy URI scheme")?;
+    // RFC 3986 makes only the scheme case-insensitive. Credentials and parameters
+    // must reach their protocol parser unchanged.
+    let normalized;
+    let uri = if scheme.bytes().any(|c| c.is_ascii_uppercase()) {
+        normalized = format!("{}://{rest}", scheme.to_ascii_lowercase());
+        normalized.as_str()
+    } else {
+        uri
+    };
     if uri.starts_with("mierus://") {
         parse_mierus_uri(uri)
     } else if uri.starts_with("wireguard://") {
@@ -516,16 +526,11 @@ pub fn parse_proxy_uri(uri: &str) -> Result<Node> {
     }
 }
 
-/// Validate the advertised hopping range before using the URI's fixed port.
-pub(crate) fn validate_hysteria2_mport(value: &str, fixed_port: u16) -> Result<()> {
-    let mut includes_fixed_port = false;
-    anyhow::ensure!(!value.is_empty(), "Invalid Hysteria2 mport range");
+/// Use an advertised hopping port for the initial QUIC connection as well.
+pub(crate) fn hysteria2_initial_port(value: &str, preferred: u16) -> Result<u16> {
+    let mut initial = None;
     for part in value.split(',') {
-        let (start, end) = if let Some((start, end)) = part.split_once('-') {
-            (start, end)
-        } else {
-            (part, part)
-        };
+        let (start, end) = part.split_once('-').unwrap_or((part, part));
         let start: u16 = start
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 mport range"))?;
@@ -533,37 +538,32 @@ pub(crate) fn validate_hysteria2_mport(value: &str, fixed_port: u16) -> Result<(
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 mport range"))?;
         anyhow::ensure!(start > 0 && start <= end, "Invalid Hysteria2 mport range");
-        includes_fixed_port |= (start..=end).contains(&fixed_port);
+        initial.get_or_insert(start);
+        if (start..=end).contains(&preferred) {
+            initial = Some(preferred);
+        }
     }
-    anyhow::ensure!(
-        includes_fixed_port,
-        "Hysteria2 fixed port is outside mport range"
-    );
-    Ok(())
+    initial.context("Missing Hysteria2 hopping port")
 }
 
 /// Parse a hysteria2:// or hy2:// share link.
 pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
+    let (scheme, rest) = uri.split_once("://").context("Not a Hysteria2 URI")?;
     anyhow::ensure!(
-        uri.starts_with("hysteria2://") || uri.starts_with("hy2://"),
+        scheme.eq_ignore_ascii_case("hysteria2") || scheme.eq_ignore_ascii_case("hy2"),
         "Not a Hysteria2 URI"
     );
     // The Hysteria share format permits a list in the authority's port slot.
     // Parse the remainder with Url, which accepts only a single numeric port.
-    let (_, rest) = uri.split_once("://").unwrap();
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let (auth, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
     let port_list = host_port
         .rsplit_once(':')
         .map(|(_, p)| p)
         .filter(|p| p.contains([',', '-']) && !p.contains(']'));
     let normalized;
     let input = if let Some(list) = port_list {
-        let first = list.split([',', '-']).next().unwrap_or("");
-        let port = first
-            .parse::<u16>()
-            .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 port range"))?;
-        validate_hysteria2_mport(list, port)?;
+        let port = hysteria2_initial_port(list, 0)?;
         let end = uri.len() - rest.len() + authority.len();
         normalized = format!("{}{port}{}", &uri[..end - list.len()], &uri[end..]);
         &normalized
@@ -575,20 +575,74 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         matches!(parsed.path(), "" | "/"),
         "Unsupported Hysteria2 path"
     );
-    let mut auth = parsed.username().to_owned();
-    if let Some(password) = parsed.password() {
-        auth.push(':');
-        auth.push_str(password);
-    }
-    let password = urlencoding::decode(&auth)
+    // URL canonicalization discards a trailing colon in userinfo. HY2 treats
+    // the entire decoded value as a case-sensitive authentication string.
+    let password = urlencoding::decode(auth)
         .map_err(|_| anyhow::anyhow!("Invalid Hysteria2 authentication encoding"))?
         .into_owned();
-    anyhow::ensure!(!password.is_empty(), "Hysteria2 authentication is required");
     let mut params = HashMap::new();
     for (key, value) in parsed.query_pairs() {
+        let key = match key.as_ref() {
+            // v2rayN's Gecko settings and hopping/rate aliases used by other clients.
+            "minPacketSize" => "min-packet-size",
+            "maxPacketSize" => "max-packet-size",
+            "up" | "up_mbps" => "upmbps",
+            "down" | "down_mbps" => "downmbps",
+            "ports" => "mport",
+            "fingerprint" => "fp",
+            "skip-cert-verify" => "allowInsecure",
+            key => key,
+        };
+        let (key, value) = if matches!(key, "mportHopInt" | "portHopInt") {
+            let ms = value
+                .parse::<u64>()
+                .ok()
+                .and_then(|s| s.checked_mul(1000))
+                .context("Invalid Hysteria2 hop interval in seconds")?;
+            ("hop_interval_ms", ms.to_string())
+        } else {
+            (key, value.into_owned())
+        };
+        anyhow::ensure!(
+            params.insert(key.to_owned(), value).is_none(),
+            "Duplicate Hysteria2 option"
+        );
+    }
+    if let Some(list) = port_list {
+        let query_list = params.insert("mport".into(), list.into());
+        anyhow::ensure!(
+            query_list.is_none_or(|query_list| query_list == list),
+            "Conflicting Hysteria2 port ranges"
+        );
+    }
+    let server = parsed
+        .host_str()
+        .context("Missing Hysteria2 host")?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    hysteria2_node(
+        decode_fragment_name(parsed.fragment()).unwrap_or_else(|| "Hysteria2".into()),
+        server,
+        parsed.port().unwrap_or(443),
+        password,
+        &params,
+    )
+}
+
+/// Build the same native node from a share link or decoded manual form options.
+pub fn hysteria2_node(
+    name: String,
+    server: String,
+    port: u16,
+    password: String,
+    params: &HashMap<String, String>,
+) -> Result<Node> {
+    anyhow::ensure!(!password.is_empty(), "Hysteria2 authentication is required");
+    anyhow::ensure!(port != 0, "Invalid Hysteria2 port");
+    for key in params.keys() {
         anyhow::ensure!(
             matches!(
-                key.as_ref(),
+                key.as_str(),
                 "sni"
                     | "insecure"
                     | "allowInsecure"
@@ -610,35 +664,52 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
             ),
             "Unsupported Hysteria2 option; obfuscation and unknown extensions are not ignored"
         );
+    }
+    let mut skip_cert_verify = None;
+    for flag in ["insecure", "allowInsecure"]
+        .iter()
+        .filter_map(|key| params.get(*key))
+    {
+        let value = match flag.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => anyhow::bail!("Invalid Hysteria2 certificate verification option"),
+        };
         anyhow::ensure!(
-            params
-                .insert(key.into_owned(), value.into_owned())
-                .is_none(),
-            "Duplicate Hysteria2 option"
+            skip_cert_verify.is_none_or(|old| old == value),
+            "Conflicting Hysteria2 certificate verification options"
         );
+        skip_cert_verify = Some(value);
     }
     let mut extra = HashMap::new();
-    let port = parsed.port().unwrap_or(443);
-    for (k, field) in [
-        ("hop_interval_ms", HY2_HOP_INTERVAL),
-        ("hop_interval_max_ms", HY2_HOP_MAX),
-    ] {
-        if let Some(v) = params.get(k) {
-            extra.insert(field.into(), v.parse::<u64>()?.to_string());
+    let hop_ms = |key: &str| {
+        params
+            .get(key)
+            .map(|v| v.parse::<u64>())
+            .transpose()
+            .context("Invalid Hysteria2 hop interval")
+    };
+    let interval = hop_ms("hop_interval_ms")?;
+    let max_interval = hop_ms("hop_interval_max_ms")?;
+    let min = interval.unwrap_or(30_000);
+    let max = max_interval.unwrap_or(min);
+    anyhow::ensure!(
+        min > 0 && max >= min && max <= i64::MAX as u64 / 1_000_000,
+        "Invalid Hysteria2 hop interval"
+    );
+    for (field, value) in [(HY2_HOP_INTERVAL, interval), (HY2_HOP_MAX, max_interval)] {
+        if let Some(value) = value {
+            extra.insert(field.into(), value.to_string());
         }
     }
-    if let Some(list) = port_list {
-        anyhow::ensure!(
-            !params.contains_key("mport"),
-            "Duplicate Hysteria2 port range"
-        );
-        params.insert("mport".into(), list.into());
-    }
-    if let Some(mport) = params.get("mport") {
-        validate_hysteria2_mport(mport, port)?;
+    let port = if let Some(mport) = params.get("mport") {
+        let initial = hysteria2_initial_port(mport, port)?;
         extra.insert(HY2_MPORT.into(), mport.clone());
-    }
-    import_tls_pin(&params, &mut extra)?;
+        initial
+    } else {
+        port
+    };
+    import_tls_pin(params, &mut extra)?;
     // Browser profile and certificate pin are separate settings. Chrome uses
     // the versioned QUIC profile; other recognized hints retain an explicit
     // compatibility note until their own QUIC profiles are implemented.
@@ -672,7 +743,7 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         );
         extra.insert(
             HY2_FAST_OPEN.into(),
-            query_truthy(&params, "fastopen").to_string(),
+            query_truthy(params, "fastopen").to_string(),
         );
     }
     if params
@@ -682,18 +753,13 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
         anyhow::ensure!(
             params
                 .get("alpn")
+                .filter(|alpn| !alpn.is_empty())
                 .is_none_or(|alpn| alpn.split(',').all(|p| p.trim() == "h3")),
             "Chrome QUIC fingerprint requires ALPN h3"
         );
     }
-    let server = parsed
-        .host_str()
-        .context("Missing Hysteria2 host")?
-        .trim_matches(['[', ']'])
-        .to_owned();
-    anyhow::ensure!(port != 0, "Invalid Hysteria2 port");
     Ok(Node {
-        name: decode_fragment_name(parsed.fragment()).unwrap_or_else(|| "Hysteria2".into()),
+        name,
         server,
         port,
         protocol: ProxyProtocol::Hysteria2 {
@@ -717,10 +783,9 @@ pub fn parse_hysteria2_uri(uri: &str) -> Result<Node> {
             xhttp: None,
             transport_type: TransportType::Tls,
             tls: Some(TlsConfig {
-                sni: params.get("sni").cloned(),
-                skip_cert_verify: query_truthy(&params, "insecure")
-                    || query_truthy(&params, "allowInsecure"),
-                alpn: params.get("alpn").map(|v| {
+                sni: params.get("sni").filter(|v| !v.is_empty()).cloned(),
+                skip_cert_verify: skip_cert_verify.unwrap_or(false),
+                alpn: params.get("alpn").filter(|v| !v.is_empty()).map(|v| {
                     v.split(',')
                         .map(str::trim)
                         .filter(|v| !v.is_empty())
@@ -1980,6 +2045,66 @@ mod tests {
     }
 
     #[test]
+    fn bulk_hysteria2_preserves_provider_options_in_uri_and_base64_lists() {
+        let lines = concat!(
+            "# fixtures\r\n",
+            "Hy2://User:P%40ss%2B@[2001:db8::1]:443/?ports=18000-18100&mportHopInt=9",
+            "&obfs=gecko&obfs-password=Mixed%26Case&minPacketSize=600&maxPacketSize=1300",
+            "&up=3.5&down=4&alpn=h3&fingerprint=chrome&skip-cert-verify=false#v6\r\n",
+            "hysteria2://Other@peer.invalid:8443,8450-8452/?sni=&alpn=&portHopInt=10#hopping\r\n",
+            "trOjAn://sample@other.invalid:443#other\r\n",
+        );
+        let encoded = general_purpose::URL_SAFE_NO_PAD.encode(lines);
+        for (content, hint) in [
+            (lines, "auto"),
+            (lines, "v2ray"),
+            (encoded.as_str(), "auto"),
+            (encoded.as_str(), "base64"),
+            (encoded.as_str(), "v2ray"),
+        ] {
+            let nodes =
+                super::super::subscription::parse_subscription_content(content, hint).unwrap();
+            assert_eq!(nodes.len(), 3, "{hint}");
+            let node = &nodes[0];
+            assert_eq!(node.server, "2001:db8::1");
+            assert_eq!(node.port, 18000);
+            let ProxyProtocol::Hysteria2 {
+                password,
+                obfs: Some(obfs),
+                ..
+            } = &node.protocol
+            else {
+                panic!("missing HY2 protocol settings")
+            };
+            assert_eq!(password, "User:P@ss+");
+            assert_eq!(obfs.kind, "gecko");
+            assert_eq!(obfs.password, "Mixed&Case");
+            assert_eq!(obfs.gecko_sizes(), (600, 1300));
+            assert_eq!(node.extra[HY2_MPORT], "18000-18100");
+            assert_eq!(node.extra[HY2_HOP_INTERVAL], "9000");
+            assert_eq!(node.extra[HY2_UP], "3.5");
+            assert_eq!(node.extra[HY2_DOWN], "4");
+            assert_eq!(hysteria2_fingerprint(node), Some("chrome"));
+            let tls = node.transport.as_ref().unwrap().tls.as_ref().unwrap();
+            assert!(!tls.skip_cert_verify);
+            assert_eq!(tls.alpn.as_deref().unwrap(), ["h3"]);
+            let second = &nodes[1];
+            assert_eq!(second.port, 8443);
+            let tls = second.transport.as_ref().unwrap().tls.as_ref().unwrap();
+            assert!(tls.sni.is_none() && tls.alpn.is_none());
+            assert_eq!(second.extra[HY2_HOP_INTERVAL], "10000");
+            for node in &nodes[..2] {
+                crate::create_outbound_unwarmed(node).unwrap();
+                let roundtrip = parse_hysteria2_uri(&node_to_share_uri(node)).unwrap();
+                assert_eq!(
+                    crate::node_fingerprint(node),
+                    crate::node_fingerprint(&roundtrip)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn hysteria_parameters_reject_invalid_and_conflicting_values() {
         let prefix = "hy2://synthetic@vpn.example.invalid:443?";
         for query in [
@@ -1988,6 +2113,12 @@ mod tests {
             "upmbps=1000001",
             "fastopen=maybe",
             "alpn=h3&alpn=hysteria",
+            "mportHopInt=0",
+            "mportHopInt=99999999999999999999",
+            "mportHopInt=15&hop_interval_ms=999",
+            "insecure=0&skip-cert-verify=true",
+            "insecure=unexpected",
+            "ech=required-but-unsupported",
         ] {
             assert!(parse_hysteria2_uri(&format!("{prefix}{query}")).is_err());
         }
@@ -2338,6 +2469,10 @@ mod native_protocol_regressions {
     }
     #[test]
     fn hysteria_auth_sni_and_security_options_are_not_lost() {
+        let trailing_colon = parse_hysteria2_uri("HY2://User:@peer.invalid").unwrap();
+        assert!(
+            matches!(trailing_colon.protocol, ProxyProtocol::Hysteria2 { password, .. } if password == "User:")
+        );
         let node=parse_hysteria2_uri("hy2://synthetic%40auth:secret@vpn.example.invalid:443?sni=tls.example.invalid&insecure=1").unwrap();
         let ProxyProtocol::Hysteria2 { password, .. } = node.protocol else {
             unreachable!()
@@ -2373,7 +2508,7 @@ mod native_protocol_regressions {
             restored[0].extra.get(HY2_MPORT).map(String::as_str),
             Some("35000-39000")
         );
-        for mport in ["", "35000-", "39000-35000", "35001-39000", "0-35000"] {
+        for mport in ["", "35000-", "39000-35000", "0-35000"] {
             let uri = format!("hy2://synthetic@example.invalid:35000?mport={mport}");
             assert!(parse_hysteria2_uri(&uri).is_err(), "{mport}");
         }

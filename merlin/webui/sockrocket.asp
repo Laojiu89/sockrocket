@@ -407,13 +407,15 @@ body.bg {min-width:0!important}
             <button type="button" id="sr-mode-global" onclick="setProxyMode('global')">全局</button>
             <button type="button" id="sr-mode-direct" onclick="setProxyMode('direct')">直连</button>
           </div>
-          <div class="chip"><span class="dot acc"></span>出口 IP <b id="sr-wan-ip">—</b></div>
+          <div class="chip"><span class="dot acc"></span>WAN 地址 <b id="sr-wan-ip">—</b></div>
         </div>
 
 </div>
         <div class="toolbar" style="margin-top:12px">
-          <button class="btn btn-accent btn-sm" onclick="runSpeedtest()">节点测速</button>
-          <button class="btn btn-sm" onclick="runIpCheck()">检查出口 IP</button>
+          <button class="btn btn-accent btn-sm" id="sr-home-lat-check" onclick="runSpeedtest()">测出口延迟</button>
+          <output class="hint" id="sr-home-lat-result" hidden></output>
+          <button class="btn btn-sm" id="sr-home-ip-check" onclick="runIpCheck()">检查出口 IP</button>
+          <output class="hint" id="sr-home-ip-result" hidden></output>
           <button class="btn btn-sm" onclick="restartService()">重启服务</button>
           <div class="spacer"></div>
           <button class="btn btn-sm" onclick="srShowPage('logs');runDiagnostics()">运行诊断</button>
@@ -436,15 +438,23 @@ body.bg {min-width:0!important}
         </div>
         <div class="card collapsible" id="sr-add-node-card">
           <h3>添加节点</h3>
+          <details>
+            <summary>从节点分享链接添加</summary>
+            <div class="fg"><label for="sr-an-uri">单个节点链接</label>
+              <input type="password" id="sr-an-uri" autocomplete="off" spellcheck="false" placeholder="hy2://、vless://、ss:// 等">
+            </div>
+            <p class="hint">使用链接中的节点名称、认证和传输参数。订阅地址请在「订阅」页添加。</p>
+            <button type="button" class="btn btn-sm" id="sr-an-uri-submit" onclick="addNodeFromUri()">添加链接中的节点</button>
+          </details>
           <div class="form-grid">
             <div class="fg"><label for="sr-an-name">名称</label><input type="text" id="sr-an-name" placeholder="例如：常用线路"></div>
-            <div class="fg"><label>协议</label>
+            <div class="fg"><label for="sr-an-proto">协议</label>
               <select id="sr-an-proto" onchange="updateAddNodeFields()">
                 <option value="shadowsocks">shadowsocks</option>
                 <option value="vmess">vmess</option>
                 <option value="trojan">trojan</option>
                 <option value="vless">vless</option>
-                <option value="hysteria2">hysteria2</option>
+                <option value="hysteria2">Hysteria2（HY2）</option>
                 <option value="tuic">tuic</option>
                 <option value="mieru">Mieru（TCP）</option>
                 <option value="anytls">AnyTLS</option>
@@ -459,8 +469,25 @@ body.bg {min-width:0!important}
             <div class="fg"><label for="sr-an-cipher">加密方式</label><input type="text" id="sr-an-cipher" placeholder="(ss/vmess, default aes-256-gcm/auto)"></div>
           </div>
           <div class="form-grid" id="sr-an-tls-fields" hidden>
-            <div class="fg"><label for="sr-an-sni">TLS 服务器名称（可选）</label><input type="text" id="sr-an-sni" placeholder="默认使用服务器地址"></div>
+            <div class="fg"><label for="sr-an-sni">TLS 服务器名称（SNI，可选）</label><input type="text" id="sr-an-sni" placeholder="默认使用服务器地址"></div>
             <div class="fg"><label><input type="checkbox" id="sr-an-insecure"> 跳过证书验证（仅自签名测试）</label></div>
+          </div>
+          <div id="sr-an-hy2-fields" hidden>
+            <div class="form-grid">
+              <div class="fg"><label for="sr-an-hy2-obfs">混淆方式</label><select id="sr-an-hy2-obfs" onchange="updateAddNodeFields()"><option value="">无混淆</option><option value="salamander">Salamander</option><option value="gecko">Gecko</option></select></div>
+              <div class="fg" hidden><label for="sr-an-hy2-obfs-pass">混淆密码</label><input type="password" autocomplete="new-password" id="sr-an-hy2-obfs-pass" placeholder="至少 4 字节，与服务器设置一致"></div>
+              <div class="fg"><label for="sr-an-hy2-mport">跳跃端口（填写后仅使用这些端口）</label><input type="text" id="sr-an-hy2-mport" placeholder="如 443,20000-30000"></div>
+            </div>
+            <details><summary>更多 HY2 选项</summary>
+              <div class="form-grid">
+                <div class="fg"><label for="sr-an-hy2-pin">证书 SHA-256 指纹</label><input type="text" id="sr-an-hy2-pin" placeholder="pinSHA256 / pcs"></div>
+                <div class="fg"><label for="sr-an-hy2-alpn">ALPN</label><input type="text" id="sr-an-hy2-alpn" placeholder="如 h3，多个值用逗号分隔"></div>
+                <div class="fg"><label for="sr-an-hy2-fp">QUIC 客户端指纹</label><select id="sr-an-hy2-fp"><option value="">默认</option><option value="chrome">Chrome 115（h3）</option></select></div>
+                <div class="fg"><label for="sr-an-hy2-up">上传带宽（Mbps）</label><input type="text" id="sr-an-hy2-up" placeholder="默认自动"></div>
+                <div class="fg"><label for="sr-an-hy2-down">下载带宽（Mbps）</label><input type="text" id="sr-an-hy2-down" placeholder="默认自动"></div>
+                <div class="fg"><label><input type="checkbox" id="sr-an-hy2-fastopen"> Fast Open</label></div>
+              </div>
+            </details>
           </div>
           <div id="sr-an-wg-fields" hidden>
             <p class="hint">原生用户态 WireGuard；每个节点对应一个 Peer，不改写系统路由。密钥仅保存在本机私有配置。</p>
@@ -475,7 +502,7 @@ body.bg {min-width:0!important}
               <div class="fg"><label for="sr-an-wg-keepalive">Keepalive 秒数（0 关闭）</label><input type="number" id="sr-an-wg-keepalive" min="0" max="65535" value="25"></div>
             </div>
           </div>
-          <button class="btn btn-success btn-sm" onclick="addNode()">添加</button>
+          <button type="button" class="btn btn-success btn-sm" id="sr-an-submit" onclick="addNode()">添加</button>
         </div>
         <div class="card">
           <div class="rows" id="sr-node-list"><div class="hint">正在加载…</div></div>
@@ -757,15 +784,15 @@ body.bg {min-width:0!important}
           <h3>诊断</h3>
           <div id="sr-diag-body"><div class="hint">点击“运行检查”查看服务、配置、防火墙和 DNS 状态。诊断不会自动重启服务。</div></div>
         </div>
-<div class="card"><h3>网络工具</h3><div class="toolbar"><button class="btn" onclick="runSpeedtest()">节点测速</button><button class="btn" onclick="runIpCheck()">检查出口 IP</button></div><div class="stat-grid">          <div class="stat">
-            <div class="label">节点延迟</div>
+<div class="card"><h3>网络工具</h3><div class="toolbar"><button class="btn" id="sr-diag-lat-check" onclick="runSpeedtest()">测出口延迟</button><button class="btn" id="sr-diag-ip-check" onclick="runIpCheck()">检查出口 IP</button></div><div class="stat-grid">          <div class="stat" aria-live="polite">
+            <div class="label">出口延迟</div>
             <div class="value acc" id="sr-st-lat">—</div>
             <div class="sub" id="sr-st-lat-sub">点击测速后显示</div>
           </div>          <div class="stat">
             <div class="label">系统负载</div>
             <div class="value" id="sr-st-load">—</div>
             <div class="sub" id="sr-st-uptime">—</div>
-          </div>          <div class="stat">
+          </div>          <div class="stat" aria-live="polite">
             <div class="label">出口 IP / 地区</div>
             <div class="value" id="sr-st-ip" style="font-size:15px">—</div>
             <div class="sub" id="sr-st-ip-sub">主动检查后显示</div>
@@ -952,6 +979,11 @@ function newRequestId() {
   window.crypto.getRandomValues(bytes);
   return Array.from(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
 }
+function srRequestBodyLimit(action) {
+  if (action === 'save_config') return 8 * 1024 * 1024;
+  if (action === 'batch_add_rules' || action === 'replace_rule_group') return 4 * 1024 * 1024;
+  return 1024 * 1024;
+}
 function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   var seq;
   try { seq = newRequestId(); }
@@ -963,13 +995,17 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
   var fields = {};
   // Softcenter may shell-escape JSON quotes stored in fields. Encode UTF-8
   // before dispatch so Chinese names, URLs and rule text arrive byte-for-byte.
-  var encoded = utf8b64(JSON.stringify(data || {}));
-  var chunked = (action === 'batch_add_rules' || action === 'save_config') && encoded.length > 2048;
-  if (chunked && encoded.length > 1398104) {
-    srShowMsg('请求内容超过 1 MiB，请缩小后重试。','err');
+  var bytes = new TextEncoder().encode(JSON.stringify(data || {}));
+  // The firmware field limit applies to every action, including group
+  // snapshots sent alongside a single new domain and long node share links.
+  var limit = srRequestBodyLimit(action);
+  if (bytes.length > limit) {
+    srShowMsg('请求内容超过 ' + (limit / (1024 * 1024)) + ' MiB，请缩小后重试。','err');
     if (errCb) errCb({error_code:'request_body_too_large'});
     return;
   }
+  var encoded = srBytesBase64(bytes);
+  var chunked = encoded.length > 2048;
   if (!chunked) fields['sockrocket_rpc_b64_' + seq] = encoded;
   var job = {
     id: Math.floor(Math.random() * 999999) + 1,
@@ -1023,7 +1059,7 @@ function apiKscRequest(action, data, cb, errCb, timeoutMs) {
     var values = {};
     values['sockrocket_rpc_b64_' + seq] = part;
     sendPacket({id:Math.floor(Math.random()*999999)+1, method:job.method,
-      params:['rpc_rule_part',seq,String(offset)], fields:values},
+      params:['rpc_rule_part',seq,String(offset),action], fields:values},
       function () { stage(offset + part.length); });
   }
   stage(0);
@@ -1080,10 +1116,14 @@ function b64utf8(b64) {
   } catch (e) { return ''; }
 }
 function utf8b64(s) {
-  var bytes = new TextEncoder().encode(s);
-  var bin = '';
-  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  return btoa(bin);
+  return srBytesBase64(new TextEncoder().encode(s));
+}
+function srBytesBase64(bytes) {
+  var chunks = [];
+  for (var i = 0; i < bytes.length; i += 8192) {
+    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 8192)));
+  }
+  return btoa(chunks.join(''));
 }
 function srEsc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -1162,7 +1202,7 @@ function srShowPage(p) {
     if (p === 'subs') srLoadSubs();
     if (p === 'dns') { srLoadRules(); ruleTypeChanged(); }
     if (p === 'config') srLoadConfig();
-    if (p === 'network') loadNetworkPolicy();
+    if (p === 'network' && !dnsPolicyDirty) loadNetworkPolicy();
     if (p === 'logs') loadLog();
   }
 }
@@ -1542,36 +1582,42 @@ function restartService() {
 }
 
 /* ══ Speedtest / IP check / diagnose ═══════════════════════════════ */
+function runExitCheck(action, field, pendingText, readResult) {
+  var homeButton = srElement('home-' + field + '-check');
+  if (homeButton.disabled) return;
+  var diagButton = srElement('diag-' + field + '-check');
+  var output = srElement('home-' + field + '-result');
+  function show(value, detail, color, pending) {
+    homeButton.disabled = diagButton.disabled = pending;
+    output.hidden = false;
+    output.textContent = pending ? detail : [value, detail].filter(Boolean).join(' · ');
+    var stat = srElement('st-' + field);
+    stat.textContent = value;
+    stat.className = 'value ' + color;
+    srElement('st-' + field + '-sub').textContent = detail;
+  }
+  function failed(d) {
+    var message = d && (d.msg || d.error_message);
+    if (!message) message = d && d.error_code === 'timeout' ? '请求超时，请重试。' : '检查未完成，请确认路由器连接后重试。';
+    show('失败', message, 'bad', false);
+  }
+  show('…', pendingText, 'acc', true);
+  srApi(action, null, function (d) {
+    var result = d && d.ok && readResult(d);
+    if (result) show(result.value, result.detail, result.color, false);
+    else failed(d);
+  }, failed, 25000);
+}
 function runSpeedtest() {
-  srElement('st-lat').textContent = '…';
-  srElement('st-lat-sub').textContent = '正在测速…';
-  srApi('speedtest', null, function (d) {
-    var el = srElement('st-lat');
-    if (d.ok && d.latency >= 0) {
-      el.textContent = d.latency + 'ms';
-      el.className = 'value ' + (d.latency < 200 ? 'ok' : d.latency < 500 ? 'acc' : 'bad');
-      srElement('st-lat-sub').textContent = '通过当前节点';
-      SR_STATE.lat[SR_STATE.status.active_node] = d.latency;
-      renderNodes();
-      renderChrome();
-    } else {
-      el.textContent = '失败';
-      el.className = 'value bad';
-      srElement('st-lat-sub').textContent = d.msg || '连接失败';
-    }
+  runExitCheck('speedtest', 'lat', '正在测量出口延迟…', function (d) {
+    if (!Number.isFinite(d.latency) || d.latency < 0) return;
+    return {value: d.latency + ' ms', detail: '通过路由器 SOCKS 入口', color: d.latency < 200 ? 'ok' : d.latency < 500 ? 'acc' : 'bad'};
   });
 }
 function runIpCheck() {
-  srElement('st-ip').textContent = '…';
-  srElement('st-ip-sub').textContent = 'Checking…';
-  srApi('ip_check', null, function (d) {
-    if (d.ok && d.ip) {
-      srElement('st-ip').textContent = d.ip;
-      srElement('st-ip-sub').textContent = d.country || '';
-    } else {
-      srElement('st-ip').textContent = '失败';
-      srElement('st-ip-sub').textContent = d.msg || '';
-    }
+  runExitCheck('ip_check', 'ip', '正在检查出口 IP…', function (d) {
+    if (typeof d.ip !== 'string' || !d.ip) return;
+    return {value: d.ip, detail: d.country || '', color: 'ok'};
   });
 }
 var diagnosePending = false;
@@ -1617,14 +1663,32 @@ function saveSpeedTests() {
   try { sessionStorage.setItem('sr-speedtests-v1', JSON.stringify(savedSpeedTests)); }
   catch (e) { /* Measurement still works if browser storage is unavailable. */ }
 }
-var nodeLoadError = '';
+var nodeLoadError = '', nodeLoadGeneration = 0;
+function refreshNodeCatalogs() {
+  // The overview also reads node details, even when the nodes page is closed.
+  srLoadNodes();
+  PG_REVISION = null;
+  ++PG_LOAD_GENERATION;
+  if (SR_STATE.page === 'nodes') loadProxyGroups();
+  else SR_PAGE_LOADED.nodes = false;
+  if (SR_STATE.page === 'subs') srLoadSubs();
+  else {
+    ++subscriptionListGeneration;
+    SR_PAGE_LOADED.subs = false;
+  }
+  if (SR_STATE.page === 'dns') srLoadRules();
+  else SR_PAGE_LOADED.dns = false;
+}
 function srLoadNodes() {
+  var generation = ++nodeLoadGeneration;
   function failed(d) {
+    if (generation !== nodeLoadGeneration) return;
     SR_PAGE_LOADED.nodes = false;
     nodeLoadError = (d && d.msg) || '节点读取失败，请刷新。';
     renderNodes();
   }
   srApi('node_details', null, function (d) {
+    if (generation !== nodeLoadGeneration) return;
     if (d.ok === false || !Array.isArray(d.nodes)) { failed(d); return; }
     nodeLoadError = '';
     var previous = Object.create(null);
@@ -1771,7 +1835,7 @@ function testAllNodes(mode) {
   });
 }
 function clearAddNodeSecrets() {
-  ['an-user','an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id) { srElement(id).value = ''; });
+  ['an-uri','an-user','an-pass','an-uuid','an-hy2-obfs-pass','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id) { srElement(id).value = ''; });
 }
 function toggleAddNodeForm() {
   var card=srElement('add-node-card');card.classList.toggle('open');
@@ -1781,7 +1845,9 @@ function toggleAddNodeForm() {
 function updateAddNodeFields() {
   var proto=srElement('an-proto').value;
   srElement('an-user').parentNode.hidden=proto!=='mieru';
-  srElement('an-tls-fields').hidden=proto!=='anytls';
+  srElement('an-tls-fields').hidden=proto!=='anytls' && proto!=='hysteria2';
+  srElement('an-hy2-fields').hidden=proto!=='hysteria2';
+  srElement('an-hy2-obfs-pass').parentNode.hidden=!srElement('an-hy2-obfs').value;
   srElement('an-wg-fields').hidden=proto!=='wireguard';
   srElement('an-pass').parentNode.hidden=['shadowsocks','trojan','hysteria2','tuic','anytls','mieru'].indexOf(proto)<0;
   srElement('an-uuid').parentNode.hidden=['vmess','vless','tuic'].indexOf(proto)<0;
@@ -1793,20 +1859,70 @@ function addNode() {
     protocol: srElement('an-proto').value,
     server: srElement('an-server').value.trim(),
     port: Number(srElement('an-port').value),
-    password: srElement('an-pass').value,
-    uuid: srElement('an-uuid').value.trim(),
-    cipher: srElement('an-cipher').value.trim(),
-    sni: srElement('an-sni').value.trim(),
-    skip_cert_verify: srElement('an-insecure').checked,
   };
+  var secrets = {};
+  function secret(id) {
+    secrets[id] = srElement(id).value;
+    return secrets[id];
+  }
+  if (!srElement('an-pass').parentNode.hidden) data.password = secret('an-pass');
+  if (!srElement('an-uuid').parentNode.hidden) data.uuid = secret('an-uuid').trim();
+  if (!srElement('an-cipher').parentNode.hidden) data.cipher = srElement('an-cipher').value.trim();
+  if (!srElement('an-tls-fields').hidden) {
+    data.sni = srElement('an-sni').value.trim();
+    data.skip_cert_verify = srElement('an-insecure').checked;
+  }
+  if (data.protocol === 'hysteria2') {
+    if (!data.password) { srShowMsg('请填写 HY2 认证密码', 'err'); return; }
+    var hy2 = {};
+    var fields = {alpn:'alpn', pinSHA256:'pin', fp:'fp', upmbps:'up', downmbps:'down', mport:'mport', obfs:'obfs'};
+    Object.keys(fields).forEach(function(key) {
+      var value = srElement('an-hy2-' + fields[key]).value.trim();
+      if (value) hy2[key] = key === 'mport' ? value.replace(/\s*([,-])\s*/g,'$1') : value;
+    });
+    if (hy2.obfs) {
+      hy2['obfs-password'] = secret('an-hy2-obfs-pass');
+      if (!hy2['obfs-password']) { srShowMsg('请填写所选混淆方式的密码', 'err'); return; }
+    }
+    if (srElement('an-hy2-fastopen').checked) hy2.fastopen = '1';
+    data.hysteria2 = hy2;
+  }
   var split=function(value){return value.split(/[\s,]+/).filter(Boolean);};
-  if(data.protocol==='mieru') data.username=srElement('an-user').value;
-  if(data.protocol==='wireguard') data.wireguard={private_key:srElement('an-wg-private').value.trim(),public_key:srElement('an-wg-public').value.trim(),preshared_key:srElement('an-wg-psk').value.trim()||null,local_addresses:split(srElement('an-wg-address').value),allowed_ips:split(srElement('an-wg-allowed').value),dns:split(srElement('an-wg-dns').value),mtu:Number(srElement('an-wg-mtu').value),persistent_keepalive:Number(srElement('an-wg-keepalive').value),udp:true};
-  var secrets={};['an-user','an-pass','an-uuid','an-wg-private','an-wg-public','an-wg-psk'].forEach(function(id){secrets[id]=srElement(id).value;});
+  if(data.protocol==='mieru') data.username=secret('an-user');
+  if(data.protocol==='wireguard') data.wireguard={private_key:secret('an-wg-private').trim(),public_key:secret('an-wg-public').trim(),preshared_key:secret('an-wg-psk').trim()||null,local_addresses:split(srElement('an-wg-address').value),allowed_ips:split(srElement('an-wg-allowed').value),dns:split(srElement('an-wg-dns').value),mtu:Number(srElement('an-wg-mtu').value),persistent_keepalive:Number(srElement('an-wg-keepalive').value),udp:true};
   if (!data.name || !data.server || !Number.isInteger(data.port) || data.port < 1 || data.port > 65535) { srShowMsg('请填写名称、服务器和有效端口', 'err'); return; }
+  submitNode(data, function () {
+    Object.keys(secrets).forEach(function(id) {
+      if (srElement(id).value === secrets[id]) srElement(id).value = '';
+    });
+  });
+}
+function addNodeFromUri() {
+  var input = srElement('an-uri'), uri = input.value.trim();
+  if (!uri) { srShowMsg('请粘贴一个节点分享链接。', 'err'); input.focus(); return; }
+  submitNode({uri: uri}, function () {
+    if (input.value.trim() === uri) input.value = '';
+  });
+}
+var nodeAddPending = false;
+function submitNode(data, onSaved) {
+  if (nodeAddPending) return;
+  function pending(value) {
+    nodeAddPending = value;
+    srElement('an-submit').disabled = value;
+    srElement('an-uri-submit').disabled = value;
+  }
+  pending(true);
   srApi('add_node', data, function (d) {
-    toastResp(d);
-    if (d.ok !== false) { Object.keys(secrets).forEach(function(id){if(srElement(id).value===secrets[id])srElement(id).value='';}); srLoadNodes(); refreshStatus(); }
+    pending(false);
+    if (d.ok !== true) { srShowMsg(d.msg || '节点添加失败，请检查输入。', 'err'); return; }
+    onSaved();
+    srShowMsg('节点已添加。', 'ok');
+    refreshNodeCatalogs();
+    refreshStatus();
+  }, function (d) {
+    pending(false);
+    srShowMsg((d && (d.msg || d.error_message)) || '未能确认添加结果，请刷新节点列表后核对。', 'err');
   });
 }
 function delNode(i) {
@@ -1814,18 +1930,22 @@ function delNode(i) {
   if (!node || !confirm('删除节点「' + node.name + '」？')) return;
   srApi('del_node', { index: i, expected_id: node.test_id }, function (d) {
     toastResp(d);
-    if (d.ok !== false) { srLoadNodes(); refreshStatus(); }
+    if (d.ok !== false) { refreshNodeCatalogs(); refreshStatus(); }
   });
 }
 
 /* ══ Subscriptions ═════════════════════════════════════════════════ */
+var subscriptionListGeneration = 0;
 function srLoadSubs() {
+  var generation = ++subscriptionListGeneration;
   function failed(d) {
+    if (generation !== subscriptionListGeneration) return;
     SR_PAGE_LOADED.subs = false;
     srElement('sub-list').textContent = (d && d.msg) || '订阅读取失败，请刷新。';
   }
   restoreSubscriptionJob();
   srApi('subscriptions', null, function (d) {
+    if (generation !== subscriptionListGeneration) return;
     var el = srElement('sub-list');
     if (d.ok === false || !Array.isArray(d.subs)) { failed(d); return; }
     var subs = d.subs;
@@ -1899,6 +2019,13 @@ function renderSubscriptionNotes(result) {
   var chrome = Array.isArray(notes) && notes.indexOf('hysteria2_chrome_quic_profile') >= 0;
   var fixedPort = Array.isArray(notes) && notes.indexOf('hysteria2_mport_fixed_port') >= 0;
   var text = [];
+  if (result && Number.isSafeInteger(result.skipped_subscriptions) && result.skipped_subscriptions > 0) {
+    text.push('本次有 ' + result.skipped_subscriptions + ' 个订阅未更新，请核对订阅地址与节点列表。');
+  }
+  if (result && Number.isSafeInteger(result.skipped_entries) && result.skipped_entries > 0) {
+    text.push('有 ' + result.skipped_entries + ' 条节点无效或参数不兼容，已跳过。');
+    if (Number.isSafeInteger(result.retained_entries) && result.retained_entries > 0) text.push('此次更新保留了 ' + result.retained_entries + ' 条未匹配的旧节点记录。');
+  }
   if (Array.isArray(notes) && notes.indexOf('hysteria2_port_hopping') >= 0) text.push('已启用 Hysteria2 端口跳跃，将按节点设置切换 UDP 目标端口。');
   if (fixedPort) text.push('部分 Hysteria2 节点带有多端口跳跃配置，已按订阅地址中的固定端口导入；当前版本不会定期切换端口。若网络限制持续使用同一 UDP 端口，这些节点仍可能无法连接。');
   if (chrome) text.push('已启用 Chrome 115 基线 QUIC 握手模拟（fp=chrome / chrome115，ALPN h3），包含 TLS 指纹、连接 ID 和传输参数。此基线不模拟 ALPS、浏览器 HTTP/3 请求及首包分帧；证书校验保持原样。');
@@ -1939,7 +2066,7 @@ function showSubscriptionDiagnostic(d, jobId) {
   var codes = ['request_body_invalid','request_body_too_large','request_body_read_failed','backend_failed','backend_unavailable','backend_empty_response','subscription_start_failed','subscription_job_not_found','subscription_worker_exited','timeout','network_error','http_error','parse_error','busy','dispatch_error'];
   stages.validate_subscription = '校验订阅'; stages.parse_subscription = '解析订阅节点';
   causes.DuplicateSubscription = '该订阅地址已存在'; causes.NoValidNodes = '返回内容没有可用节点或包含不兼容参数'; causes.InvalidUrl = '订阅地址格式无效';
-  codes.push('subscription_exists','subscription_no_valid_nodes','subscription_url_invalid','subscription_update_failed');
+  codes.push('subscription_exists','subscription_no_valid_nodes','subscription_url_invalid','subscription_update_failed','subscription_apply_failed');
   var code = codes.indexOf(d.error_code) >= 0 ? d.error_code : 'subscription_failed';
   var reason = causes[d.cause] || (code === 'timeout' ? '请求超时' : code === 'network_error' ? '无法连接插件接口' : code === 'busy' ? '接口正在处理其他请求' : '订阅任务未完成，请结合阶段与日志排查');
   var hint = d.cause === 'PermissionDenied' ? '检查插件数据目录及程序权限，保留已有配置。' : d.cause === 'StorageFull' || d.os_error === 28 || d.os_error === 122 ? '检查并释放路由器存储空间。' : d.cause === 'ReadOnlyFilesystem' || d.os_error === 30 ? '检查存储挂载及文件系统错误。' : '请反馈错误码、失败阶段和对应时间的脱敏日志。';
@@ -1947,6 +2074,7 @@ function showSubscriptionDiagnostic(d, jobId) {
   if (code === 'subscription_exists') hint = '在“我的订阅”中点击“全部更新”，无需重复添加。';
   if (code === 'subscription_no_valid_nodes') hint = '核对订阅格式及节点参数兼容性；现有节点会保留。';
   if (code === 'subscription_url_invalid') hint = '填写完整的 http 或 https 订阅地址；名称和格式可以留空。';
+  if (code === 'subscription_apply_failed') { reason = '节点已保存，但服务应用失败'; hint = '请检查服务状态及诊断日志。'; }
   if (code === 'subscription_update_failed') { reason = '所有订阅均未更新，原有节点已保留'; hint = '核对错误地址、服务端状态及节点参数兼容性后重试。'; }
   var status = /\bHTTP(?:\/\d(?:\.\d)?)?\s+([1-5]\d{2})\b/.exec(String(d.msg || d.error || ''));
   if (status) {
@@ -2000,7 +2128,7 @@ function acceptSubscriptionJob(d) {
     var message = job.stage === 'applying' ? (saved ? '节点已保存，正在应用设置' : '正在保存并应用订阅') : job.stage === 'saving' ? '正在保存订阅' : '正在后台下载订阅';
     if (job.stage === 'applying' && saved && subscriptionNodesLoadedJobId !== job.id) {
       subscriptionNodesLoadedJobId = job.id;
-      srLoadSubs(); srLoadNodes();
+      refreshNodeCatalogs();
     }
     srShowMsg(message + counts + '，关闭页面后仍会继续。', 'info');
     scheduleSubscriptionPoll(); return;
@@ -2008,7 +2136,7 @@ function acceptSubscriptionJob(d) {
   subscriptionBusy(false); subscriptionJobId = null;
   clearTimeout(subscriptionJobTimer);
   var result = job.result || {ok:false,msg:'订阅任务未返回结果，请刷新列表确认。'};
-  if (result.ok !== false && subscriptionJobSnapshot) {
+  if ((result.ok !== false || result.saved) && subscriptionJobSnapshot) {
     var snapshot = subscriptionJobSnapshot;
     if (srElement('sub-name').value.trim() === snapshot.name && srElement('sub-url').value.trim() === snapshot.url) {
       srElement('sub-name').value = ''; srElement('sub-url').value = '';
@@ -2017,8 +2145,12 @@ function acceptSubscriptionJob(d) {
   subscriptionJobSnapshot = null;
   renderSubscriptionNotes(result);
   if (result.ok === false) { showSubscriptionDiagnostic(result, job.id); srShowMsg(subscriptionErrorText(result, '订阅任务失败'), 'err'); }
-  else { srElement('sub-diagnostic').hidden = true; toastResp(result); }
-  srLoadSubs(); srLoadNodes(); refreshStatus();
+  else {
+    srElement('sub-diagnostic').hidden = true;
+    if (result.skipped_entries > 0 || result.skipped_subscriptions > 0) srShowMsg(result.msg || '部分订阅内容已跳过，请查看兼容说明。', 'info');
+    else toastResp(result);
+  }
+  refreshNodeCatalogs(); refreshStatus();
 }
 function pollSubscriptionJob(id) {
   srApi('subscription_job', id ? {id:id} : {}, acceptSubscriptionJob, function (error) {
@@ -2033,8 +2165,10 @@ function restoreSubscriptionJob() {
   srApi('subscription_job', {}, function (d) {
     if (d.ok !== false && d.job && !subscriptionPending) {
       if (d.job.state === 'running') acceptSubscriptionJob(d);
-      else if (d.job.result && d.job.result.ok === false) showSubscriptionDiagnostic(d.job.result, d.job.id);
-      else if (d.job.result) renderSubscriptionNotes(d.job.result);
+      else if (d.job.result) {
+        renderSubscriptionNotes(d.job.result);
+        if (d.job.result.ok === false) showSubscriptionDiagnostic(d.job.result, d.job.id);
+      }
     }
   }, function () { subscriptionJobChecked = false; }, 12000);
 }
@@ -2079,7 +2213,7 @@ function delSub(i) {
   if (!sub || !confirm('删除订阅「' + (sub.name || '未命名订阅') + '」及其专属节点？')) return;
   srApi('del_sub', { index: i, expected_id: sub.id }, function (d) {
     toastResp(d);
-    if (d.ok !== false) { srLoadSubs(); refreshStatus(); }
+    if (d.ok !== false) { refreshNodeCatalogs(); refreshStatus(); }
   });
 }
 function updateSubs() {
@@ -2089,22 +2223,22 @@ function updateSubs() {
 }
 
 
-var SR_PROXY_GROUPS=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_KEEP_CURRENT='', PG_BUSY=false, PG_LOAD_GENERATION=0;
+var SR_PROXY_GROUPS=[], PG_GROUPS=[], PG_NODES=[], PG_REVISION=null, PG_EDIT_REVISION=null, PG_ORIGINAL='', PG_KEEP_CURRENT='', PG_BUSY=false, PG_LOAD_GENERATION=0;
 function loadProxyGroups(){
   if(PG_BUSY)return;
   var generation=++PG_LOAD_GENERATION;
   srApi('proxy_groups',null,function(d){
     if(generation!==PG_LOAD_GENERATION)return;
     if(!d.ok||!Array.isArray(d.groups)||!Array.isArray(d.nodes)){toastResp(d);return;}
-    PG_NODES=d.nodes;PG_REVISION=d.revision;setProxyGroupTargets(d.groups);renderProxyGroups();
-  },function(){srShowMsg('节点分组读取失败，请刷新重试。','err');});
+    PG_NODES=d.nodes;PG_GROUPS=d.groups;PG_REVISION=d.revision;setProxyGroupTargets(d.groups);renderProxyGroups();
+  },function(){if(generation===PG_LOAD_GENERATION)srShowMsg('节点分组读取失败，请刷新重试。','err');});
 }
 function renderProxyGroups(){
-  srElement('proxy-group-list').innerHTML=SR_PROXY_GROUPS.length?SR_PROXY_GROUPS.map(function(g,i){return '<div class="toolbar" style="margin-bottom:10px"><strong>'+srEsc(g.name)+'</strong><span class="hint">'+g.members.length+' 个成员 · '+srEsc(g.selected_node||'当前成员不可用')+(g.missing_members?' · '+g.missing_members+' 个失效成员':'')+'</span><div class="spacer"></div><button class="btn btn-sm" onclick="editProxyGroup('+i+')">查看 / 编辑</button><button class="btn btn-sm" onclick="deleteProxyGroup('+i+')">删除</button></div>';}).join(''):'<p class="hint">尚无分组。新建后可在规则、策略和设备出口中选择。</p>';
+  srElement('proxy-group-list').innerHTML=PG_GROUPS.length?PG_GROUPS.map(function(g,i){return '<div class="toolbar" style="margin-bottom:10px"><strong>'+srEsc(g.name)+'</strong><span class="hint">'+g.members.length+' 个成员 · '+srEsc(g.selected_node||'当前成员不可用')+(g.missing_members?' · '+g.missing_members+' 个失效成员':'')+'</span><div class="spacer"></div><button class="btn btn-sm" onclick="editProxyGroup('+i+')">查看 / 编辑</button><button class="btn btn-sm" onclick="deleteProxyGroup('+i+')">删除</button></div>';}).join(''):'<p class="hint">尚无分组。新建后可在规则、策略和设备出口中选择。</p>';
 }
 function editProxyGroup(i){
   if(PG_BUSY||!PG_REVISION){srShowMsg('请先刷新分组。','err');return;}
-  var g=SR_PROXY_GROUPS[i]||{name:'',type:'select',members:[],current:null};
+  var g=PG_GROUPS[i]||{name:'',type:'select',members:[],current:null};
   PG_ORIGINAL=g.name;PG_EDIT_REVISION=PG_REVISION;
   srElement('pg-name').value=g.name;srElement('pg-type').value=g.type;
   var ns=g.members.map(function(fp){return PG_NODES.find(function(n){return n.fingerprint===fp;})||{fingerprint:fp,name:'失效成员（可移除）'};}).concat(PG_NODES.filter(function(n){return g.members.indexOf(n.fingerprint)<0;}));
@@ -2189,13 +2323,29 @@ function moveProxyGroupMember(value,direction){
 }
 function mutateProxyGroup(action,body){
   if(PG_BUSY)return;PG_BUSY=true;PG_LOAD_GENERATION++;srElement('pg-save').disabled=true;
-  function done(d){PG_BUSY=false;srElement('pg-save').disabled=false;toastResp(d||{ok:false,msg:'请求未完成，请刷新核对保存状态'});if(d&&d.ok)srElement('proxy-group-editor').hidden=true;loadProxyGroups();SR_PAGE_LOADED.dns=false;invalidateRuleTrace('分组已更新，请刷新规则后重新检查。');}
-  srApi(action,body,done,done,60000);
+  function finish(){
+    PG_BUSY=false;srElement('pg-save').disabled=false;
+    loadProxyGroups();SR_PAGE_LOADED.dns=false;
+  }
+  function unconfirmed(){
+    srShowMsg('未能确认分组是否已保存，请核对刷新后的分组列表。','err');
+    invalidateRuleTrace('分组保存结果未确认，请刷新规则后重新检查。');
+    finish();
+  }
+  srApi(action,body,function(d){
+    if(!d || typeof d.ok!=='boolean'){unconfirmed();return;}
+    toastResp(d);
+    if(d.ok || d.saved){
+      srElement('proxy-group-editor').hidden=true;
+      invalidateRuleTrace('分组已更新，请刷新规则后重新检查。');
+    }
+    finish();
+  },unconfirmed,60000);
 }
 function saveProxyGroup(){
   mutateProxyGroup('save_proxy_group',{revision:PG_EDIT_REVISION,original_name:PG_ORIGINAL,group:{name:srElement('pg-name').value.trim(),type:srElement('pg-type').value,members:proxyGroupMemberState().filter(function(row){return row.selected;}).map(function(row){return row.value;}),current:proxyGroupCurrent()}});
 }
-function deleteProxyGroup(i){var g=SR_PROXY_GROUPS[i];if(!g||!confirm('删除分组 '+g.name+'？被规则引用时会拒绝删除。'))return;mutateProxyGroup('delete_proxy_group',{revision:PG_REVISION,name:g.name});}
+function deleteProxyGroup(i){var g=PG_GROUPS[i];if(!g||!confirm('删除分组 '+g.name+'？被规则引用时会拒绝删除。'))return;mutateProxyGroup('delete_proxy_group',{revision:PG_REVISION,name:g.name});}
 function deviceOption(value, label) {
   return '<option value="'+srEsc(value)+'">'+srEsc(label)+'</option>';
 }
@@ -2558,6 +2708,7 @@ var RULE_SELECTED_GROUP = null, RULE_LOCAL_GROUPS = [], RULE_WORKSPACE_MODE = 'l
 var RULE_ADD_BASELINE = null, RULE_ROW_BASELINE = null;
 var RULE_PRESET_GROUP = null;
 var RULE_IMPORT_MODE = false, RULE_IMPORT_PENDING = false, RULE_IMPORT_GENERATION = 0;
+var ruleImportCache = null;
 function saveBuiltinRoute(target) {
   if(ruleWorkspaceLocked() || !SR_STATE.builtinRoute)return;
   if(!confirm('修改内置国内 / 局域网的处理方式？')){renderRules(false);return;}
@@ -2577,15 +2728,19 @@ function discardRuleDraft() { return !ruleWorkspaceDirty() || confirm('放弃当
 function ruleWorkspaceLocked() {return rulePending || RULE_READ_PENDING || RULE_FLOW_ERROR || !RULE_RULE_REVISION;}
 function syncRuleWorkspace() {
   syncWorkspaceTabs();
-  var names=[];
-  (SR_STATE.ruleRows || []).forEach(function(r){if(isFinalRule(r))return;var name=(r.group || '').trim();if(names.indexOf(name)<0)names.push(name);});
-  RULE_LOCAL_GROUPS=RULE_LOCAL_GROUPS.filter(function(name){return names.indexOf(name)<0;});
-  names=names.concat(RULE_LOCAL_GROUPS);
+  var counts=new Map();
+  (SR_STATE.ruleRows || []).forEach(function(r){
+    if(isFinalRule(r))return;
+    var name=(r.group || '').trim();
+    counts.set(name,(counts.get(name)||0)+1);
+  });
+  RULE_LOCAL_GROUPS=RULE_LOCAL_GROUPS.filter(function(name){return !counts.has(name);});
+  var names=Array.from(counts.keys()).concat(RULE_LOCAL_GROUPS);
   // A refresh must not replace a draft whose group was removed elsewhere.
   if(RULE_SELECTED_GROUP !== null && names.indexOf(RULE_SELECTED_GROUP)<0 && (RULE_ADD_BASELINE !== null || RULE_ROW_BASELINE !== null))names.push(RULE_SELECTED_GROUP);
   if(names.indexOf(RULE_SELECTED_GROUP)<0)RULE_SELECTED_GROUP=names.length?names[0]:null;
   var picker=srElement('rule-group-select'), members=ruleGroupMembers(RULE_SELECTED_GROUP), locked=ruleWorkspaceLocked();
-  picker.innerHTML=names.length?names.map(function(name){return '<option value="'+srEsc(name)+'">'+srEsc(name || '未分组')+' · '+ruleGroupMembers(name).length+' 条</option>';}).join(''):'<option value="">暂无分组，请新建</option>';
+  picker.innerHTML=names.length?names.map(function(name){return '<option value="'+srEsc(name)+'">'+srEsc(name || '未分组')+' · '+(counts.get(name)||0)+' 条</option>';}).join(''):'<option value="">暂无分组，请新建</option>';
   picker.value=RULE_SELECTED_GROUP === null?'':RULE_SELECTED_GROUP;
   picker.disabled=locked || !names.length;
   var builtin=srElement('builtin-route-target');
@@ -2680,8 +2835,10 @@ function startRuleAddition(method) {
   resetRuleEditor();
   srElement('rule-add-panel').hidden=false;
   srElement('rule-editor-state').textContent='向「'+(RULE_SELECTED_GROUP || '未分组')+'」添加规则';
-  var proxy=ruleGroupMembers(RULE_SELECTED_GROUP).filter(function(r){return proxyLikeTarget(r.target);});
-  srElement('rule-target').value=proxy.length?proxy[0].target:'proxy';
+  var proxy=ruleGroupMembers(RULE_SELECTED_GROUP).find(function(r){
+    return proxyLikeTarget(r.target) && Object.prototype.hasOwnProperty.call(RULE_TARGET_LABEL,r.target);
+  });
+  srElement('rule-target').value=proxy?proxy.target:'proxy';
   if(importing) {
     RULE_IMPORT_MODE=true;RULE_WORKSPACE_MODE='import';renderRuleAddMethod('url');
     srElement('rule-entry-mode').value='bulk';srElement('rule-dup').value='skip';
@@ -2707,6 +2864,8 @@ function fetchRuleList() {
     if(!d || d.ok===false || typeof d.text!=='string' || !d.text.trim()) {srElement('rule-import-state').textContent=d&&(d.msg||d.error_message)||'读取失败，请检查链接后重试；现有规则未改变。';return;}
     var editor = srElement('rule-batch');
     editor.value = d.text;
+    ruleImportCache = typeof d.preview_token === 'string' && /^[0-9a-f]{96}$/.test(d.preview_token)
+      ? {token:d.preview_token, text:editor.value} : null;
     editor.focus();
     editor.selectionStart = editor.selectionEnd = 0;
     editor.scrollTop = 0;
@@ -2714,7 +2873,7 @@ function fetchRuleList() {
     srElement('rule-import-state').textContent='已读取 '+Number(d.count||0)+' 条待导入规则。'+(skipped.length?'已跳过不支持的类型：'+skipped.join('、')+'。':'')+'请检查预览后确认添加。';
     previewRuleChanges();
   }
-  srApi('fetch_rule_list',{url:url,target:srElement('rule-target').value,group:RULE_SELECTED_GROUP},finish,finish,40000);
+  srApi('fetch_rule_list',{url:url,cache_preview:true,target:srElement('rule-target').value,group:RULE_SELECTED_GROUP},finish,finish,40000);
 }
 var SR_RULE_NODES = [];
 function ruleActiveNodeName() {
@@ -2764,7 +2923,12 @@ function renderRulePreset() {
   var destination=rulePresetGroup(p);
   var rows=SR_STATE.ruleRows||[],members=ruleGroupMembers(destination),enabled=members.filter(function(r){return r.enabled!==false;}).length;
   var ruleType=p.rule_type||'domain-suffix';
-  var missing=p.domains.filter(function(d){return !rows.some(function(r){return (RULE_PRESET_GROUP!==null ? (r.group||'')===destination : (ruleType!=='domain' || r.group===destination)) && !r.source && r.rule_type===ruleType && String(r.pattern).replace(/^\.+/,'').toLowerCase()===d.toLowerCase();});}).length;
+  var existing=new Set();
+  rows.forEach(function(r){
+    var inScope=RULE_PRESET_GROUP!==null ? (r.group||'')===destination : (ruleType!=='domain' || r.group===destination);
+    if(inScope && !r.source && r.rule_type===ruleType)existing.add(String(r.pattern).replace(/^\.+/,'').toLowerCase());
+  });
+  var missing=p.domains.filter(function(d){return !existing.has(d.toLowerCase());}).length;
   srElement('rule-preset-target').textContent='默认：'+RULE_TARGET_LABEL[p.target];
   srElement('rule-preset-description').textContent='添加到「'+(destination||'未分组')+'」，初始未启用。'+(p.description||'');
   srElement('rule-preset-state').textContent=(members.length?'当前组 '+members.length+' 条 · 已启用 '+enabled+' 条':'尚未添加 · 未启用')+' · 预设共 '+p.domains.length+' 个域名'+(missing?' · 可添加 '+missing+' 条':' · 域名规则已存在，不重复添加');
@@ -3423,8 +3587,9 @@ function proxyLikeTarget(target) {
   return target==='proxy' || (typeof target==='string' && (target.indexOf('group:')===0 || target.indexOf('node:')===0));
 }
 function setRuleGroupEnabled(enc, enabled) {
-  var group=decodeURIComponent(enc),members=ruleGroupMembers(group.trim()).map(function(r){var expected=Object.assign({},r);delete expected.index;return expected;});
-  ruleApi('set_rule_group_enabled', { destinations_only:true, group: group, enabled: !!enabled, expected_rules:members }, function (d) {
+  if(ruleWorkspaceLocked())return;
+  var group=decodeURIComponent(enc);
+  ruleApi('set_rule_group_enabled', { destinations_only:true, group:group, enabled:!!enabled, revision:RULE_RULE_REVISION }, function (d) {
     toastResp(d);
   });
 }
@@ -3482,7 +3647,8 @@ function cancelRuleEditor() {if(discardRuleDraft()){resetRuleEditor();renderRule
 function resetRuleEditor() {
   RULE_OPTIONS_OPEN=false;
   closeRuleCreateMenu();srElement('rule-group-creator').hidden=true;
-  RULE_EDIT_GROUP=null;RULE_EDIT_MEMBERS=null;RULE_EDIT_ROW=null;RULE_ADD_BASELINE=null;RULE_ROW_BASELINE=null;RULE_WORKSPACE_MODE='list';
+  RULE_EDIT_GROUP=null;RULE_EDIT_REVISION=null;RULE_EDIT_ROW=null;RULE_ADD_BASELINE=null;RULE_ROW_BASELINE=null;RULE_WORKSPACE_MODE='list';
+  ruleImportCache=null;
   RULE_IMPORT_MODE=false;RULE_IMPORT_PENDING=false;RULE_IMPORT_GENERATION++;RULE_PRESET_GROUP=null;renderRuleAddMethod('manual');
   srElement('rule-import-panel').hidden=true;srElement('rule-import-url').value='';srElement('rule-import-state').textContent='';
   srElement('rule-add-panel').hidden=true;srElement('rule-edit-panel').hidden=true;
@@ -3503,7 +3669,11 @@ function previewRuleChanges() {
 
   var bulk = RULE_EDIT_GROUP !== null || srElement('rule-entry-mode').value === 'bulk';
   var text = (bulk ? srElement('rule-batch').value : srElement('rule-pattern').value).trim();
-  if (!text && (bulk || srElement('rule-type').value !== 'final')) { srShowMsg('请先填写或粘贴规则。','err'); return; }
+  if (!text && (bulk || srElement('rule-type').value !== 'final')) {
+    srShowMsg(bulk ? '请输入至少一条规则，每行一条。' : '请输入匹配内容。','err');
+    srElement(bulk ? 'rule-batch' : 'rule-pattern').focus();
+    return;
+  }
   rulePreviewSnapshot = ruleEditorSnapshot();
   srElement('rule-preview-title').textContent = RULE_EDIT_GROUP !== null ? '确认替换整个分组' : '确认添加规则';
   srElement('rule-preview-apply').textContent = RULE_EDIT_GROUP !== null ? '保存整组修改' : RULE_IMPORT_MODE ? '添加这 '+text.split(/\r?\n/).filter(function(line){return line.trim() && !/^\s*[#;]/.test(line);}).length+' 条规则' : '添加到「'+(RULE_SELECTED_GROUP||'未分组')+'」';
@@ -3521,7 +3691,7 @@ function applyRulePreview() {
   srElement('rule-preview-dialog').close(); addRule();
 }
 var RULE_EDIT_GROUP = null;
-var RULE_EDIT_MEMBERS = null;
+var RULE_EDIT_REVISION = null;
 function editRuleGroup(enc) {
   var key = decodeURIComponent(enc);
   var members = ruleGroupMembers(key);
@@ -3529,7 +3699,7 @@ function editRuleGroup(enc) {
   resetRuleEditor();RULE_SELECTED_GROUP=key;RULE_WORKSPACE_MODE='bulk';srElement('rule-add-panel').hidden=false;
   srElement('rule-priority').value = '';
   RULE_EDIT_GROUP = key;renderRuleAddMethod('manual');
-  RULE_EDIT_MEMBERS = members.map(function(r) { var copy = Object.assign({},r); delete copy.index; return copy; });
+  RULE_EDIT_REVISION = RULE_RULE_REVISION;
   srElement('rule-entry-mode').value = 'bulk';
   srElement('rule-editor-state').textContent = '批量修改「' + (key || '未分组')+'」的规则';
   srElement('rule-edit-cancel').hidden = false;
@@ -3569,12 +3739,11 @@ function addRule() {
   var replace = srElement('rule-dup').value === 'replace';
   if (RULE_EDIT_GROUP !== null) {
     if (!grp && RULE_EDIT_GROUP) { srShowMsg('请输入分组名称', 'err'); return; }
-    var editText = srElement('rule-batch').value.trim()
-      || srElement('rule-pattern').value.trim();
-    if (t !== 'final' && !editText) { srShowMsg('请先粘贴该分组的规则', 'err'); return; }
+    var editText = srElement('rule-batch').value.trim();
+    if (t !== 'final' && !editText) { srShowMsg('请输入至少一条规则，每行一条。', 'err'); return; }
     var oldGroup = RULE_EDIT_GROUP, draft = ruleEditorSnapshot();
     ruleApi('replace_rule_group', withPriority({
-      destinations_only:true, group: oldGroup, new_group: grp, rule_type: t, target: g, text: editText, expected_rules: RULE_EDIT_MEMBERS
+      destinations_only:true, group: oldGroup, new_group: grp, rule_type: t, target: g, text: editText, revision: RULE_EDIT_REVISION
     }), function (d) {
       toastResp(d);
       if (d.ok !== false) {
@@ -3586,8 +3755,17 @@ function addRule() {
   if (RULE_SELECTED_GROUP === null) { srShowMsg('请先选择或新建分组。', 'err'); return; }
   if (srElement('rule-entry-mode').value === 'bulk') {
     var text = srElement('rule-batch').value, batchDraft=ruleEditorSnapshot();
-    if (!text.trim()) { srShowMsg('请先粘贴至少一条规则', 'err'); return; }
-    ruleApi('batch_add_rules', withPriority({ destinations_only:true, text: text, target: g, group: grp, rule_type: t, replace: RULE_IMPORT_MODE ? false : replace, group_only: RULE_IMPORT_MODE }), function (d) {
+    if (!text.trim()) { srShowMsg('请输入至少一条规则，每行一条。', 'err'); return; }
+    var cached = RULE_IMPORT_MODE && ruleImportCache && text === ruleImportCache.text ? ruleImportCache : null;
+    var body = withPriority({ destinations_only:true, target:g, group:grp, rule_type:t, replace:RULE_IMPORT_MODE ? false : replace, group_only:RULE_IMPORT_MODE });
+    if (cached) body.preview_token = cached.token;
+    else body.text = text;
+    ruleApi('batch_add_rules', body, function (d) {
+      if (cached && ruleImportCache === cached && d.ok === false) {
+        // An older backend after a rollback may also reject a token-only request.
+        ruleImportCache = null;
+        srElement('rule-import-state').textContent = d.preview_unavailable ? d.msg : '草稿已保留；再次确认将使用编辑框中的规则。';
+      }
       toastResp(d);
       if (d.ok !== false) {
         if (ruleEditorSnapshot() === batchDraft) {resetRuleEditor();renderRules(false);}
@@ -3662,15 +3840,17 @@ function srDownloadConfig() {
     } catch (e) { failed(); }
   }, failed);
 }
+function srConfigFits(base64Length) {
+  var envelope = JSON.stringify({config:'', expected_revision:savedConfigRevision});
+  if (base64Length + envelope.length <= srRequestBodyLimit('save_config')) return true;
+  srShowMsg('配置过大，编码后的保存请求超过 8 MiB。', 'err');
+  return false;
+}
 async function srImportConfig(input) {
   var file = input.files[0];
   input.value = '';
   if (!file || savedConfigText === null || configSaving) return;
-  // The CGI cap includes both the base64 payload and its JSON envelope.
-  var envelope = JSON.stringify({config:'', expected_revision:savedConfigRevision});
-  if (4 * Math.ceil(file.size / 3) + envelope.length > 1024 * 1024) {
-    srShowMsg('文件过大，编码后的保存请求超过 1 MiB。', 'err'); return;
-  }
+  if (!srConfigFits(4 * Math.ceil(file.size / 3))) return;
   var editor = srElement('config-text'), before = editor.value;
   var generation = ++configReadGeneration;
   var text;
@@ -3720,15 +3900,22 @@ function srSaveConfig() {
   if (savedConfigText === null) { srShowMsg('请先加载现有配置，再编辑保存。','err'); return; }
   var text = srElement('config-text').value;
   if (text === savedConfigText) return;
+  var encoded = utf8b64(text);
+  if (!srConfigFits(encoded.length)) return;
   // Reads begun before this write are no longer an authoritative snapshot.
   ++configReadGeneration;
   configSaving = true; configEdited();
   srElement('config-state').textContent = '正在校验并保存…';
   function done() { configSaving = false; configEdited(); }
-  srApi('save_config', { config: utf8b64(text), expected_revision: savedConfigRevision }, function (d) {
+  srApi('save_config', { config: encoded, expected_revision: savedConfigRevision }, function (d) {
     if (d.ok !== false || d.saved) {
       savedConfigText = text;
       savedConfigRevision = d.revision;
+      refreshNodeCatalogs();
+      if (!dnsPolicyDirty) {
+        SR_PAGE_LOADED.network = false;
+        if (SR_STATE.page === 'network') loadNetworkPolicy();
+      }
     }
     done();
     if (d.ok === false) srElement('config-state').textContent = d.msg || '保存失败，请检查配置。';

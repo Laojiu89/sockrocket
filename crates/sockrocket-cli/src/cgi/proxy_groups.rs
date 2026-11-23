@@ -105,7 +105,7 @@ pub(super) fn valid_target(target: &str) -> bool {
 pub(super) fn check_revision(map: &Mapping, post: &J) -> bool {
     revision_matches(map, &load_routing_rules(map), post)
 }
-fn revision_matches(map: &Mapping, rules: &[RoutingRule], post: &J) -> bool {
+pub(super) fn revision_matches(map: &Mapping, rules: &[RoutingRule], post: &J) -> bool {
     post.get("revision")
         .and_then(J::as_str)
         .is_some_and(|expected| expected == route_trace::revision_for_rules(map, rules))

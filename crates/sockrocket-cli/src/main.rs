@@ -17,9 +17,9 @@ use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
     SharedOutbound, SwappableOutbound, TrafficLedger, TunProxy, apply_subscription_refresh,
-    create_outbound, fetch_subscription_with, flush_system_dns_cache, node_fingerprint,
-    node_public_id, normalize_node_names, publish_traffic_catalog, resolve_to_ips,
-    set_catalog_active, set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
+    create_outbound, flush_system_dns_cache, node_fingerprint, node_public_id,
+    normalize_node_names, publish_traffic_catalog, resolve_to_ips, set_catalog_active,
+    set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
 
 fn main() -> Result<()> {
@@ -1188,25 +1188,32 @@ async fn resolve_config(
     let mut refreshed = Vec::new();
     for subscription in &config.subscriptions {
         let socks = std::net::SocketAddr::from(([127, 0, 0, 1], config.socks_port));
-        match fetch_subscription_with(subscription, Some(socks)).await {
-            Ok(nodes) if nodes.is_empty() => {
+        match sockrocket_core::config::subscription::fetch_subscription_report_with(
+            subscription,
+            Some(socks),
+        )
+        .await
+        {
+            Ok(report) if report.nodes.is_empty() => {
                 tracing::warn!(
                     "Subscription '{}' fetched OK but produced 0 nodes (check format / content)",
                     subscription.name
                 );
             }
-            Ok(nodes) => {
+            Ok(report) => {
                 tracing::info!(
+                    skipped_entries = report.skipped_entries,
                     "Fetched {} node(s) from subscription '{}'",
-                    nodes.len(),
+                    report.nodes.len(),
                     subscription.name
                 );
                 refreshed.push((
                     sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
                         url: subscription.url.clone(),
                         revision: subscription.refresh_revision.clone(),
+                        skipped_entries: report.skipped_entries,
                     },
-                    nodes,
+                    report.nodes,
                 ));
             }
             Err(e) => {
@@ -1220,13 +1227,15 @@ async fn resolve_config(
         }
     }
 
-    let changed = apply_subscription_refresh(
-        &mut config,
-        refreshed
-            .iter()
-            .map(|(source, nodes)| (source.url.clone(), nodes.clone()))
-            .collect(),
-    );
+    let merged = refreshed
+        .iter()
+        .map(|(source, nodes)| {
+            let mut nodes = nodes.clone();
+            source.retain_unparsed_nodes(&config.nodes, &mut nodes);
+            (source.url.clone(), nodes)
+        })
+        .collect();
+    let changed = apply_subscription_refresh(&mut config, merged);
     normalize_node_names(&mut config.nodes);
     Ok((config, changed, refreshed))
 }

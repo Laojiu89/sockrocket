@@ -99,6 +99,34 @@ impl Drop for Fixture {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+#[test]
+fn large_rule_backup_roundtrips_through_cgi() {
+    use std::fmt::Write as _;
+
+    let fixture = Fixture::new();
+    let path = fixture.0.join("config.yaml");
+    let initial = fs::read(&path).unwrap();
+    let mut base: serde_yaml::Mapping = serde_yaml::from_slice(&initial).unwrap();
+    base.remove("rules");
+    let mut yaml = serde_yaml::to_string(&base).unwrap();
+    yaml.push_str("rules:\n");
+    for n in 0..20_000 {
+        writeln!(yaml, "  - {{group: sites, rule_type: domain-suffix, pattern: source-{n}.example.invalid, target: direct, priority: 0, enabled: true}}").unwrap();
+    }
+    assert!(yaml.len() > 2 * 1024 * 1024);
+    fs::write(&path, &yaml).unwrap();
+    let backup = fixture.call("config", json!({}));
+    fs::write(&path, initial).unwrap();
+    let current = fixture.call("config", json!({}));
+    let restored = fixture.call(
+        "save_config",
+        json!({"config":backup["config_base64"], "expected_revision":current["revision"]}),
+    );
+    assert_eq!(restored["saved"], true, "{restored}");
+    assert_eq!(restored["revision"], backup["revision"]);
+    assert_eq!(fs::read_to_string(path).unwrap(), yaml);
+}
+
 #[cfg(unix)]
 #[test]
 fn saved_nodes_are_available_while_apply_is_still_running() {
@@ -210,7 +238,7 @@ fn slow_refresh_does_not_block_edits_or_restore_a_deleted_subscription() {
     let server = thread::spawn(move || {
         let (mut connection, _) = listener.accept().unwrap();
         let mut request = [0; 4096];
-        connection.read(&mut request).unwrap();
+        assert!(connection.read(&mut request).unwrap() > 0);
         arrived_tx.send(()).unwrap();
         release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         let body = "ss://YWVzLTEyOC1nY206Zml4dHVyZQ@new.invalid:8388#new";
@@ -417,6 +445,14 @@ fn background_job_survives_cgi_exit_deduplicates_and_preserves_stop() {
         fixture.call("subscriptions", json!({}))["subs"][0]["name"],
         "订阅 1"
     );
+    assert_eq!(finished["result"]["saved"], true);
+    assert_eq!(finished["result"]["applied"], false);
+    assert!(
+        finished["result"]["msg"]
+            .as_str()
+            .unwrap()
+            .contains("下次启动")
+    );
     assert!(fixture.0.join("stopped").exists());
     assert!(
         !fixture.0.join("lifecycle-called").exists(),
@@ -537,7 +573,11 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
                     .nth(1)
                     .unwrap()
                     .trim_start_matches('/');
-                let body = format!("hy2://synthetic@new-{index}.invalid:443?fp=chrome#new-{index}");
+                let mut body =
+                    format!("hy2://synthetic@new-{index}.invalid:443?fp=chrome#new-{index}");
+                if index == "2" {
+                    body.push_str("\nhy2://synthetic@bad.invalid:443?obfs=salamander#invalid");
+                }
                 let _ = write!(
                     connection,
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -568,12 +608,14 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
                 job["result"]["ok"], true,
                 "partial refresh reports warnings"
             );
-            assert_eq!(job["result"]["node_count"], 4);
+            assert_eq!(job["result"]["node_count"], 5);
+            assert_eq!(job["result"]["skipped_entries"], 1);
+            assert_eq!(job["result"]["retained_entries"], 1);
             assert_eq!(
                 job["result"]["compatibility_notes"],
                 json!(["hysteria2_chrome_quic_profile"])
             );
-            assert_eq!(job["result"]["warnings"].as_array().unwrap().len(), 1);
+            assert_eq!(job["result"]["warnings"].as_array().unwrap().len(), 2);
             assert_eq!(job["result"]["skipped_subscriptions"], 1);
             break;
         }
@@ -585,7 +627,11 @@ fn batch_reports_progress_through_slow_apply_and_keeps_failed_source_nodes() {
         &fs::read_to_string(fixture.0.join("config.yaml")).unwrap(),
     )
     .unwrap();
-    assert_eq!(saved.nodes.len(), 4);
+    assert_eq!(saved.nodes.len(), 5);
+    assert!(
+        saved.nodes.iter().any(|n| n.server == "old-2.invalid"),
+        "partial source retains its unmatched node"
+    );
     assert!(
         saved
             .nodes

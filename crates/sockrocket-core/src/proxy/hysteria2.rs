@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use anyhow::{Result, bail};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::config::model::TlsConfig;
@@ -29,29 +30,18 @@ const HY2_CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from
 /// a sequential scan pays the full QUIC handshake timeout per dead entry, which
 /// blows the caller's overall deadline when several ALPN candidates are tried.
 const HY2_ADDR_STAGGER: std::time::Duration = std::time::Duration::from_millis(500);
-/// Stagger between concurrent ALPN candidates for the *same* address. Official
-/// Hysteria2 servers only accept "hysteria" and panels only accept "h3", so
-/// when the first candidate is going to fail by timeout (dead network path)
-/// the second would otherwise pay another full handshake timeout sequentially.
+/// Stagger between ALPN candidates for the same address.
 const HY2_ALPN_STAGGER: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Address-attempt context for spawned happy-eyeballs tasks. Avoids borrowing
-/// `&self` across task boundaries.
-struct Hysteria2Attempt {
-    server: String,
-    port: u16,
-    sni: String,
-    chrome_fingerprint: bool,
-    socket_options: Option<Arc<super::hysteria2_socket::Options>>,
+struct AuthenticatedSession {
+    endpoint: quinn::Endpoint,
+    connection: quinn::Connection,
+    alpn: String,
+    control: tokio::task::JoinSet<()>,
 }
 
-impl Hysteria2Attempt {
-    async fn try_addr(
-        &self,
-        addr: std::net::SocketAddr,
-        client_config: &quinn::ClientConfig,
-        alpn: &str,
-    ) -> Result<(quinn::Endpoint, quinn::Connection)> {
+impl Hysteria2Outbound {
+    fn endpoint_for(&self, addr: std::net::SocketAddr) -> Result<quinn::Endpoint> {
         let bind_addr: std::net::SocketAddr = if addr.is_ipv4() {
             "0.0.0.0:0".parse()?
         } else {
@@ -62,12 +52,19 @@ impl Hysteria2Attempt {
         } else {
             quinn::EndpointConfig::default()
         };
-        let mut endpoint = match &self.socket_options {
-            Some(options) => options.endpoint(bind_addr, addr, config)?,
-            None => super::quic_conn::client_endpoint_with_config(bind_addr, config)?,
-        };
-        endpoint.set_default_client_config(client_config.clone());
+        match &self.socket_options {
+            Some(options) => options.endpoint(bind_addr, addr, config),
+            None => super::quic_conn::client_endpoint_with_config(bind_addr, config),
+        }
+    }
 
+    async fn try_addr(
+        &self,
+        addr: std::net::SocketAddr,
+        mut endpoint: quinn::Endpoint,
+        alpn: &str,
+    ) -> Result<AuthenticatedSession> {
+        endpoint.set_default_client_config(self.build_client_config(alpn)?);
         let connecting = endpoint
             .connect(addr, &self.sni)
             .map_err(|e| anyhow::anyhow!("QUIC connect setup to {} failed: {}", addr, e))?;
@@ -94,7 +91,15 @@ impl Hysteria2Attempt {
                 )
             })?;
         tracing::info!("Hysteria2 QUIC connection established, ALPN={}", alpn);
-        Ok((endpoint, connection))
+        let control = tokio::time::timeout(HY2_CONNECT_TIMEOUT, self.authenticate_h3(&connection))
+            .await
+            .map_err(|_| anyhow::anyhow!("Hysteria2 HTTP/3 authentication timed out"))??;
+        Ok(AuthenticatedSession {
+            endpoint,
+            connection,
+            alpn: alpn.into(),
+            control,
+        })
     }
 }
 
@@ -114,11 +119,10 @@ pub struct Hysteria2Outbound {
     down_bps: u64,
     upload: Option<Arc<super::hysteria2_bandwidth::Budget>>,
     fast_open: bool,
-    /// ALPN candidates tried in order. The official Hysteria2 server requires
-    /// "hysteria", but some widely deployed panels only accept "h3" — once a
-    /// candidate succeeds it is remembered to skip the search on reconnects.
+    /// A previously authenticated ALPN goes to the front on reconnect.
     alpn_candidates: Vec<String>,
     working_alpn: std::sync::Mutex<Option<String>>,
+    h3_control: std::sync::Mutex<tokio::task::JoinSet<()>>,
     conn_state: QuicConnectionState,
     udp_hub: tokio::sync::Mutex<Option<Arc<super::quic_datagram::Hub>>>,
 }
@@ -203,6 +207,7 @@ impl Hysteria2Outbound {
             fast_open: extra.get(HY2_FAST_OPEN).is_some_and(|v| v == "true"),
             alpn_candidates,
             working_alpn: std::sync::Mutex::new(None),
+            h3_control: Default::default(),
             conn_state: QuicConnectionState::new(),
             udp_hub: tokio::sync::Mutex::new(None),
         })
@@ -266,211 +271,92 @@ impl Hysteria2Outbound {
     /// Concurrent callers share a single QUIC session: the expensive
     /// connect+authenticate path is serialized inside `QuicConnectionState`.
     async fn get_connection(&self) -> Result<quinn::Connection> {
+        self.get_connection_with(&|addr| self.endpoint_for(addr))
+            .await
+    }
+
+    async fn get_connection_with(
+        &self,
+        endpoint: &(impl Fn(std::net::SocketAddr) -> Result<quinn::Endpoint> + Sync),
+    ) -> Result<quinn::Connection> {
         self.conn_state
             .get_or_connect(|| async {
-                let (endpoint, conn) = self.create_connection().await?;
-                self.authenticate_h3(&conn).await?;
-                Ok((endpoint, conn))
+                let session = self.create_connection(endpoint).await?;
+                *self.working_alpn.lock().unwrap() = Some(session.alpn);
+                *self.h3_control.lock().unwrap() = session.control;
+                Ok((session.endpoint, session.connection))
             })
             .await
     }
 
-    async fn create_connection(&self) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    async fn create_connection(
+        &self,
+        endpoint: &(impl Fn(std::net::SocketAddr) -> Result<quinn::Endpoint> + Sync),
+    ) -> Result<AuthenticatedSession> {
         let addrs = resolve_server_addrs(&self.server, self.port).await?;
-        tracing::debug!("Hysteria2 server resolution completed");
-
-        // Try the remembered working ALPN first, then remaining candidates.
-        let mut alpns: Vec<String> = Vec::new();
-        if let Some(working) = self.working_alpn.lock().unwrap().clone() {
-            alpns.push(working);
-        }
+        let remembered = self.working_alpn.lock().unwrap().clone();
+        let mut alpns: Vec<String> = remembered.iter().cloned().collect();
         for candidate in &self.alpn_candidates {
             if !alpns.contains(candidate) {
                 alpns.push(candidate.clone());
             }
         }
 
-        // Happy-eyeballs over resolved addresses × ALPN candidates: the first
-        // successful handshake wins. When a working ALPN is already remembered
-        // only that one is raced across addresses; otherwise all candidates
-        // race with a short stagger so a dead network path doesn't serialize
-        // per-ALPN timeouts.
-        match self.connect_staggered(&addrs, &alpns).await {
-            Ok((pair, used_alpn)) => {
-                *self.working_alpn.lock().unwrap() = Some(used_alpn);
-                Ok(pair)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Try one address: endpoint setup + QUIC handshake with timeout.
-    async fn try_addr(
-        &self,
-        addr: std::net::SocketAddr,
-        client_config: &quinn::ClientConfig,
-        alpn: &str,
-    ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-        let attempt = Hysteria2Attempt {
-            server: self.server.clone(),
-            port: self.port,
-            sni: self.sni.clone(),
-            chrome_fingerprint: self.chrome_fingerprint,
-            socket_options: self.socket_options.clone(),
+        let retry_single = remembered.is_some() && addrs.len() == 1 && alpns.len() == 1;
+        let attempts = if retry_single {
+            HY2_CONNECT_ATTEMPTS_PER_ADDR
+        } else {
+            1
         };
-        attempt.try_addr(addr, client_config, alpn).await
+        let mut last_error = anyhow::anyhow!("no Hysteria2 addresses to connect");
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                tokio::time::sleep(HY2_CONNECT_RETRY_BACKOFF).await;
+            }
+            match self.connect_staggered(&addrs, &alpns, endpoint).await {
+                Ok(session) => return Ok(session),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(last_error)
     }
 
-    /// Happy-eyeballs over all resolved addresses and ALPN candidates:
-    /// attempts run concurrently with staggers, the first success wins and
-    /// aborts the rest. This avoids paying a full handshake timeout per dead
-    /// IP or per rejected ALPN when the network path is dead (common with
-    /// CDN-fronted nodes resolving to mixed live/dead addresses).
+    /// An address and ALPN win only after the peer has accepted our credentials.
+    /// Dropping the other attempt futures cancels their connections and drivers.
     async fn connect_staggered(
         &self,
         addrs: &[std::net::SocketAddr],
         alpns: &[String],
-    ) -> Result<((quinn::Endpoint, quinn::Connection), String)> {
-        // Already know a working ALPN? Don't race others — just probe addresses.
-        let remembered = self.working_alpn.lock().unwrap().clone();
-        if let Some(alpn) = remembered {
-            let client_config = self.build_client_config(&alpn)?;
-            return self
-                .race_addresses(addrs, &client_config, &alpn)
-                .await
-                .map(|pair| (pair, alpn));
-        }
-        // First connection: race every (addr, alpn) pair concurrently.
-        let mut set: tokio::task::JoinSet<Result<((quinn::Endpoint, quinn::Connection), String)>> =
-            tokio::task::JoinSet::new();
-        let mut last_err = None;
-        for (i, addr) in addrs.iter().copied().enumerate() {
-            if i > 0 {
-                tokio::select! {
-                    _ = tokio::time::sleep(HY2_ADDR_STAGGER) => {}
-                    Some(res) = set.join_next() => {
-                        if let Ok(Ok(pair)) = res {
-                            set.abort_all();
-                            return Ok(pair);
-                        }
-                    }
-                }
-            }
-            for (j, alpn) in alpns.iter().enumerate() {
-                if j > 0 {
+        endpoint: &(impl Fn(std::net::SocketAddr) -> Result<quinn::Endpoint> + Sync),
+    ) -> Result<AuthenticatedSession> {
+        let mut attempts = FuturesUnordered::new();
+        let mut last_error = anyhow::anyhow!("no Hysteria2 addresses to connect");
+        for addr in addrs {
+            for (index, alpn) in alpns.iter().enumerate() {
+                if !attempts.is_empty() {
+                    let stagger = if index == 0 {
+                        HY2_ADDR_STAGGER
+                    } else {
+                        HY2_ALPN_STAGGER
+                    };
                     tokio::select! {
-                        _ = tokio::time::sleep(HY2_ALPN_STAGGER) => {}
-                        Some(res) = set.join_next() => {
-                            if let Ok(Ok(pair)) = res {
-                                set.abort_all();
-                                return Ok(pair);
-                            }
-                        }
+                        Some(result) = attempts.next() => match result {
+                            Ok(session) => return Ok(session),
+                            Err(error) => last_error = error,
+                        },
+                        _ = tokio::time::sleep(stagger) => {}
                     }
                 }
-                let client_config = match self.build_client_config(alpn) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
-                };
-                let this = Hysteria2Attempt {
-                    server: self.server.clone(),
-                    port: self.port,
-                    sni: self.sni.clone(),
-                    chrome_fingerprint: self.chrome_fingerprint,
-                    socket_options: self.socket_options.clone(),
-                };
-                let alpn = alpn.clone();
-                set.spawn(async move {
-                    this.try_addr(addr, &client_config, &alpn)
-                        .await
-                        .map(|pair| (pair, alpn))
-                });
+                attempts.push(async move { self.try_addr(*addr, endpoint(*addr)?, alpn).await });
             }
         }
-
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(pair)) => {
-                    set.abort_all();
-                    return Ok(pair);
-                }
-                Ok(Err(e)) => last_err = Some(e),
-                Err(join_err) => {
-                    last_err = Some(anyhow::anyhow!("QUIC attempt task failed: {}", join_err));
-                }
+        while let Some(result) = attempts.next().await {
+            match result {
+                Ok(session) => return Ok(session),
+                Err(error) => last_error = error,
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no addresses to connect")))
-    }
-
-    /// Race only the addresses for a single ALPN (used when the working ALPN
-    /// is already known).
-    async fn race_addresses(
-        &self,
-        addrs: &[std::net::SocketAddr],
-        client_config: &quinn::ClientConfig,
-        alpn: &str,
-    ) -> Result<(quinn::Endpoint, quinn::Connection)> {
-        if addrs.len() == 1 {
-            // Single address: plain sequential retries, no racing overhead.
-            let mut last_err = None;
-            for attempt in 1..=HY2_CONNECT_ATTEMPTS_PER_ADDR {
-                match self.try_addr(addrs[0], client_config, alpn).await {
-                    Ok(pair) => return Ok(pair),
-                    Err(e) => last_err = Some(e),
-                }
-                if attempt < HY2_CONNECT_ATTEMPTS_PER_ADDR {
-                    tokio::time::sleep(HY2_CONNECT_RETRY_BACKOFF).await;
-                }
-            }
-            return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no attempts made")));
-        }
-
-        let mut set: tokio::task::JoinSet<Result<(quinn::Endpoint, quinn::Connection)>> =
-            tokio::task::JoinSet::new();
-        for (i, addr) in addrs.iter().copied().enumerate() {
-            if i > 0 {
-                // Stagger, but bail the wait early if a previous attempt
-                // already succeeded or failed (fast failover).
-                tokio::select! {
-                    _ = tokio::time::sleep(HY2_ADDR_STAGGER) => {}
-                    Some(res) = set.join_next() => {
-                        if let Ok(Ok(pair)) = res {
-                            set.abort_all();
-                            return Ok(pair);
-                        }
-                    }
-                }
-            }
-            let this = Hysteria2Attempt {
-                server: self.server.clone(),
-                port: self.port,
-                sni: self.sni.clone(),
-                chrome_fingerprint: self.chrome_fingerprint,
-                socket_options: self.socket_options.clone(),
-            };
-            let cfg = client_config.clone();
-            let alpn = alpn.to_string();
-            set.spawn(async move { this.try_addr(addr, &cfg, &alpn).await });
-        }
-
-        let mut last_err = None;
-        while let Some(res) = set.join_next().await {
-            match res {
-                Ok(Ok(pair)) => {
-                    set.abort_all();
-                    return Ok(pair);
-                }
-                Ok(Err(e)) => last_err = Some(e),
-                Err(join_err) => {
-                    last_err = Some(anyhow::anyhow!("QUIC attempt task failed: {}", join_err));
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no addresses to connect")))
+        Err(last_error)
     }
 
     /// Authenticate via HTTP/3 POST /auth request.
@@ -478,9 +364,17 @@ impl Hysteria2Outbound {
     /// Per the Hysteria2 spec, the client sends an HTTP/3 request:
     ///   POST /auth with Hysteria-Auth header containing the password.
     /// The server responds with status 233 if authentication succeeds.
-    async fn authenticate_h3(&self, conn: &quinn::Connection) -> Result<()> {
+    async fn authenticate_h3(&self, conn: &quinn::Connection) -> Result<tokio::task::JoinSet<()>> {
         let h3_conn = h3_quinn::Connection::new(conn.clone());
-        let (_conn, mut sender) = h3::client::new(h3_conn).await?;
+        let (mut driver, mut sender) = h3::client::new(h3_conn).await?;
+        // RFC 9114 forbids closing the HTTP/3 control stream during the QUIC
+        // session. Keep the driver and a sender alive while using raw HY2 streams.
+        let mut control = tokio::task::JoinSet::new();
+        let keep_sender = sender.clone();
+        control.spawn(async move {
+            driver.wait_idle().await;
+            drop(keep_sender);
+        });
 
         // Build the auth request
         let req = http::Request::builder()
@@ -505,10 +399,7 @@ impl Hysteria2Outbound {
 
         tracing::info!("Hysteria2 authentication successful (HTTP/3 status 233)");
 
-        // Drop the h3 client — we now use raw QUIC streams for proxy requests
-        drop(sender);
-
-        Ok(())
+        Ok(control)
     }
 }
 
@@ -766,6 +657,9 @@ async fn skip_exact<R: AsyncRead + Unpin>(recv: &mut R, len: usize) -> Result<()
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod session_tests;
 
 #[cfg(test)]
 mod tests {

@@ -40,7 +40,12 @@ printf 'Content-Type: application/json\\nCache-Control: no-cache\\n\\n{"ok":true
 
     preview={'text':'DOMAIN,example.invalid,PROXY\n'*200,'group':'自定义'}
     config={'config':base64.b64encode(('nodes: []\n# 测试\n'*160).encode()).decode(),'expected_revision':'saved'}
-    for action,payload in [('batch_add_rules',preview),('save_config',config)]:
+    snapshot=[dict(group='自定义',rule_type='domain',pattern=f'{n}.example.invalid',target='direct') for n in range(60)]
+    replacement=dict(group='自定义',expected_rules=snapshot,text='\n'.join(r['pattern'] for r in snapshot)+'\nnew.invalid')
+    node={'uri':'hy2://'+('x'*2200)+'@example.invalid:443'}
+    for action,payload in [('batch_add_rules',preview),('replace_rule_group',replacement),
+                           ('set_rule_group_enabled',dict(group='自定义',expected_rules=snapshot,enabled=False)),
+                           ('add_node',node),('save_config',config)]:
         body=base64.b64encode(json.dumps(payload,ensure_ascii=False).encode()).decode()
         for offset in range(0,len(body),2048):
             (root/'dbus'/('sockrocket_rpc_b64_'+a)).write_text(body[offset:offset+2048])
@@ -58,6 +63,32 @@ printf 'Content-Type: application/json\\nCache-Control: no-cache\\n\\n{"ok":true
         assert not (root/'bodies'/action).exists()
         assert not json.loads(result.read_text())['ok']
         assert not (root/'runtime'/('rule-body-'+a)).exists()
+
+    for action in ['add_rule','batch_add_rules','replace_rule_group','set_rule_group_enabled',
+                   'delete_rule_group','add_node','save_config']:
+        run(action,a)
+        assert not (root/'bodies'/action).exists(), 'missing firmware field must never dispatch an empty mutation'
+        assert '未收到' in json.loads(result.read_text())['msg']
+
+    # Exercise the final piece of each capped transfer without dispatching
+    # thousands of shell processes. The initial pieces are already on disk.
+    stage=root/'runtime'/('rule-body-'+a)
+    for action,maximum in [('save_config',11184812),('replace_rule_group',5592408),('add_rule',1398104)]:
+        with stage.open('wb') as f:
+            f.truncate(maximum-4)
+        dbus_field=root/'dbus'/('sockrocket_rpc_b64_'+a)
+        dbus_field.write_text('YQ==')
+        subprocess.run(['sh',str(bridge),'123456','rpc_rule_part',a,str(maximum-4),action],env=env,check=True)
+        assert stage.stat().st_size==maximum
+        dbus_field.write_text('YQ==')
+        assert subprocess.run(['sh',str(bridge),'123456','rpc_rule_part',a,str(maximum),action],env=env).returncode!=0
+        subprocess.run(['sh',str(bridge),'123456',action,a,str(maximum)],env=env,check=True)
+        assert (root/'bodies'/action).stat().st_size==maximum
+        (root/'bodies'/action).unlink()
+        with stage.open('wb') as f:
+            f.truncate(maximum+4)
+        subprocess.run(['sh',str(bridge),'123456',action,a,str(maximum+4)],env=env,check=True)
+        assert not (root/'bodies'/action).exists() and not json.loads(result.read_text())['ok']
 
     for n in range(1,5):
         slot=root/'runtime'/('slot-'+str(n));slot.mkdir();(slot/'pid').write_text(str(os.getpid()))

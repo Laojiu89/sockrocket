@@ -200,9 +200,7 @@ pub fn replace_rule_group_where(
     rules.retain(|r| !include(r) || !same_rule_group(&r.group, old_group));
     let at = insert_at.min(rules.len());
     let n = incoming.len();
-    for (i, rule) in incoming.into_iter().enumerate() {
-        rules.insert(at + i, rule);
-    }
+    rules.splice(at..at, incoming);
     Ok(n)
 }
 

@@ -10,9 +10,10 @@ function fixture() {
     window:{crypto:webcrypto}, Uint8Array, URL,
     srCopyText:(text)=>copied.push(text), srShowMsg:(message)=>messages.push(message), toastResp(){}, srLoadNodes(){nodeLoads.push(true);}, refreshStatus(){},
     setTimeout(cb,delay){const id=++next;timers.set(id,cb);timerDelays.push(delay);return id;},clearTimeout:id=>timers.delete(id),
-    SR_STATE:{},SR_PAGE_LOADED:{},srEsc:value=>value});
-  vm.runInContext(source.slice(source.indexOf('function newRequestId('),source.indexOf('function apiKscRequest(')) +
-    source.slice(source.indexOf('function srLoadSubs()'),source.indexOf('/* ══ Routing rules')),context);
+    SR_STATE:{page:'subs'},SR_PAGE_LOADED:{nodes:true,subs:true,dns:true},srEsc:value=>value});
+  vm.runInContext(source.slice(source.indexOf('function newRequestId('),source.indexOf('function srRequestBodyLimit(')) +
+    source.slice(source.indexOf('function refreshNodeCatalogs()'),source.indexOf('function srLoadNodes()')) +
+    source.slice(source.indexOf('var subscriptionListGeneration'),source.indexOf('/* ══ Routing rules')),context);
   const request=action=>{const index=requests.findIndex(r=>r[0]===action); assert.ok(index>=0,action);return requests.splice(index,1)[0];};
   const tick=()=>{const [id,cb]=timers.entries().next().value;timers.delete(id);cb();};
   return {context,requests,request,tick,element,messages,copied,nodeLoads,timerDelays};
@@ -98,6 +99,8 @@ notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:['hysteria2_m
 assert.equal(notes.element('sub-notes').hidden,false);
 assert.match(notes.element('sub-notes-text').textContent,/固定端口导入/);
 assert.match(notes.element('sub-notes-text').textContent,/不会定期切换端口/);
+notes.context.renderSubscriptionNotes({ok:true,skipped_entries:2,retained_entries:1,skipped_subscriptions:3,compatibility_notes:[]});
+assert.match(notes.element('sub-notes-text').textContent,/3 个订阅未更新.*2 条节点.*跳过.*保留了 1 条/);
 notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:[]});
 assert.equal(notes.element('sub-notes').hidden,true);
 console.log('PASS: optional names, invalid-address rejection and informational compatibility notes');
@@ -141,3 +144,33 @@ for (const action of ['rename_sub', 'del_sub']) {
   assert.equal(body.expected_id, 'fixture-id');
   assert.doesNotMatch(JSON.stringify(body), /example\.invalid/);
 }
+
+const removed = fixture();
+removed.context.confirm = () => true;
+removed.context.SR_STATE.subs = [{index:0,id:'fixture-id',name:'Old subscription'}];
+removed.context.srLoadSubs();
+const staleSubscriptions = removed.request('subscriptions');
+removed.context.delSub(0);
+removed.request('del_sub')[2]({ok:true});
+assert.equal(removed.nodeLoads.length, 1, 'deleting a subscription also refreshes its nodes');
+assert.equal(removed.context.SR_PAGE_LOADED.nodes, false, 'the next nodes visit reloads eligible group members');
+assert.equal(removed.context.SR_PAGE_LOADED.dns, false, 'the next rules visit reloads node targets');
+removed.request('subscriptions')[2]({subs:[]});
+staleSubscriptions[2]({subs:[{index:0,name:'Old subscription'}]});
+assert.equal(removed.context.SR_STATE.subs.length, 0, 'an older response cannot restore a removed subscription');
+console.log('PASS: deleting a subscription refreshes dependent catalogs and ignores late responses');
+
+const delayedNodes = fixture();
+Object.assign(delayedNodes.context, {
+  savedSpeedTests:{}, speedTestsRestored:true, renderNodes(){}, renderChrome(){}, nodeViewKey:n=>n.test_id
+});
+Object.assign(delayedNodes.context.SR_STATE, {nodes:[], lat:{}});
+vm.runInContext(source.slice(source.indexOf('var nodeLoadError'),source.indexOf('function renderNodes()')),delayedNodes.context);
+delayedNodes.context.srLoadNodes();
+const obsoleteNodes = delayedNodes.request('node_details');
+delayedNodes.context.srLoadNodes();
+delayedNodes.request('node_details')[2]({nodes:[{test_id:'new'}]});
+obsoleteNodes[2]({nodes:[{test_id:'old'}]});
+obsoleteNodes[3]({msg:'obsolete error'});
+assert.equal(delayedNodes.context.SR_STATE.nodes[0].test_id,'new');
+assert.equal(delayedNodes.context.nodeLoadError,'');

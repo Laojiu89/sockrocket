@@ -102,22 +102,25 @@ fn import_peers(peers: &[Value], mut parse: impl FnMut(&Value) -> Result<Node>) 
 pub(crate) fn from_clash(value: &serde_yaml::Value) -> Result<Node> {
     let mut v = serde_json::to_value(value)?;
     if let Some(list) = v.as_object_mut().and_then(|m| m.remove("peers")) {
+        // With peers, Mihomo ignores the top-level single-peer endpoint and keys.
+        let peer_fields = [
+            "server",
+            "port",
+            "public-key",
+            "reserved",
+            "pre-shared-key",
+            "preshared-key",
+            "allowed-ips",
+        ];
+        for field in peer_fields {
+            v.as_object_mut().unwrap().remove(field);
+        }
         return import_peers(
             list.as_array().context("Invalid WireGuard peers")?,
             |peer| {
                 let mut entry = v.clone();
                 for (k, v) in peer.as_object().context("Invalid WireGuard peer")? {
-                    if matches!(
-                        k.as_str(),
-                        "server"
-                            | "port"
-                            | "public-key"
-                            | "reserved"
-                            | "pre-shared-key"
-                            | "preshared-key"
-                            | "allowed-ips"
-                            | "persistent-keepalive"
-                    ) {
+                    if peer_fields.contains(&k.as_str()) || k == "persistent-keepalive" {
                         entry[k] = v.clone();
                     }
                 }
@@ -623,6 +626,33 @@ mod tests {
         let mut invalid = value;
         invalid["mtu"] = json!(-1);
         assert!(from_singbox(&invalid).is_err());
+    }
+
+    #[test]
+    fn mihomo_peers_do_not_inherit_top_level_endpoint_or_secrets() {
+        let mut entry = json!({
+            "name":"WG peers","type":"wireguard","ip":"192.0.2.2", "private-key":STANDARD.encode([11;32]),
+            "server":"unused.invalid","port":9,"pre-shared-key":STANDARD.encode([33;32]),
+            "public-key":STANDARD.encode([77;32]),"reserved":[9,9,9],
+            "peers":[{"server":"one.invalid","port":51820,"public-key":STANDARD.encode([22;32]),"allowed-ips":["0.0.0.0/0"]},
+                     {"server":"two.invalid","port":12345,"public-key":STANDARD.encode([44;32]),"allowed-ips":["198.51.100.0/24"],"reserved":"AQID"}]
+        });
+        let entry_yaml = |v: &Value| serde_yaml::to_value(v).unwrap();
+        let node = from_clash(&entry_yaml(&entry)).unwrap();
+        assert_eq!(node.server, "one.invalid");
+        let ProxyProtocol::Wireguard { config } = &node.protocol else {
+            unreachable!()
+        };
+        assert_eq!(config.reserved, None);
+        assert_eq!(config.preshared_key, None);
+        assert_eq!(config.additional_peers[0].reserved, Some([1, 2, 3]));
+        assert_eq!(config.additional_peers[0].preshared_key, None);
+        assert!(crate::create_outbound_unwarmed(&node).is_ok());
+        entry["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("public-key");
+        assert!(from_clash(&entry_yaml(&entry)).is_err());
     }
     #[test]
     fn duplicate_parameters_and_invalid_reserved_bytes_fail_closed() {

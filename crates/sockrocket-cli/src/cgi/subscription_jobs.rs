@@ -70,18 +70,24 @@ fn alive(pid: u32, id: &str) -> bool {
     let _ = id;
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        Command::new("ps")
+        if let Ok(output) = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "command="])
             .output()
-            .is_ok_and(|output| {
-                let args = String::from_utf8_lossy(&output.stdout);
-                output.status.success()
-                    && args
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .windows(2)
-                        .any(|pair| pair == ["--subscription-worker", id])
-            })
+            && output.status.success()
+        {
+            let args = String::from_utf8_lossy(&output.stdout);
+            return args
+                .split_whitespace()
+                .zip(args.split_whitespace().skip(1))
+                .any(|pair| pair == ("--subscription-worker", id));
+        }
+        // Some Unix environments restrict ps. Marking a live worker dead here
+        // can allow a second refresh to start before the first one finishes.
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        (unsafe { libc::kill(pid, 0) } == 0)
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {

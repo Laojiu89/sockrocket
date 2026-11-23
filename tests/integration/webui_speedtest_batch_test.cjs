@@ -39,3 +39,39 @@ context.setNode(1);
 context.delNode(0);
 assert.equal(requests.shift().data.expected_id, state.nodes[1].test_id);
 assert.equal(requests.shift().data.expected_id, state.nodes[0].test_id);
+
+// The same exit probe can be launched on either page, independently of per-node measurements.
+const toolElements = new Map();
+const exitTools = vm.createContext({
+  srElement(id) {
+    assert.ok(source.includes('id="sr-' + id + '"'), id);
+    if (!toolElements.has(id)) toolElements.set(id, {disabled:false, textContent:''});
+    return toolElements.get(id);
+  },
+  srApi:(action, data, ok, fail) => requests.push({action, ok, fail})
+});
+vm.runInContext(source.slice(source.indexOf('function runExitCheck'), source.indexOf('var diagnosePending')), exitTools);
+exitTools.runIpCheck();
+exitTools.runIpCheck();
+assert.equal(requests.length, 1);
+assert.equal(requests[0].action, 'ip_check');
+assert.equal(exitTools.srElement('diag-ip-check').disabled, true);
+assert.match(exitTools.srElement('home-ip-result').textContent, /正在检查/);
+requests.shift().ok({ok:true, ip:'203.0.113.9', country:'示例地区'});
+assert.match(exitTools.srElement('home-ip-result').textContent, /203\.0\.113\.9 · 示例地区/);
+assert.equal(exitTools.srElement('st-ip').textContent, '203.0.113.9');
+assert.equal(exitTools.srElement('diag-ip-check').disabled, false);
+exitTools.runSpeedtest();
+requests.shift().fail({error_code:'timeout'});
+assert.match(exitTools.srElement('home-lat-result').textContent, /失败.*超时/);
+assert.equal(exitTools.srElement('st-lat').textContent, '失败');
+assert.equal(exitTools.srElement('home-lat-check').disabled, false);
+exitTools.runSpeedtest();
+requests.shift().ok({ok:true, latency:24});
+assert.match(exitTools.srElement('home-lat-result').textContent, /24 ms/);
+assert.equal(exitTools.srElement('st-lat').textContent, '24 ms');
+exitTools.runIpCheck();
+requests.shift().ok({ok:false, msg:'服务已停止'});
+assert.match(exitTools.srElement('home-ip-result').textContent, /服务已停止/);
+assert.equal(exitTools.srElement('st-ip').textContent, '失败');
+console.log('PASS: overview and diagnostics report exit probe results, errors and retries');

@@ -8,7 +8,7 @@ for (const error_code of ['timeout', 'network_error']) {
   const messages = [];
   const ctx = vm.createContext({
     configSaving:false, savedConfigText:'old', savedConfigRevision:'revision', configReadGeneration:0,
-    SR_STATE:{statusKnown:true}, utf8b64:s=>s, configEdited:()=>{}, renderChrome:()=>{},
+    SR_STATE:{statusKnown:true}, utf8b64:s=>s, srConfigFits:()=>true, configEdited:()=>{}, renderChrome:()=>{},
     srElement:name=>{if (!elements.has(name)) elements.set(name,{value:'new'}); return elements.get(name);},
     srApi:(_action,_body,_ok,fail)=>fail({error_code}), srShowMsg:message=>messages.push(message),
   });

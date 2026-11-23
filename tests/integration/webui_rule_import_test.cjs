@@ -41,3 +41,33 @@ read[2]({ok:true,count:1,text:'DOMAIN,one.invalid,PROXY'});
 c.previewRuleChanges();assert.equal(requests.length,0);c.applyRulePreview();add=request('batch_add_rules');
 assert.equal(add[1].group,'New from URL');assert.equal(add[1].replace,false);
 assert.equal(requests.length,0);console.log('PASS: group/node-group import routing, explicit confirmation, append-only requests, validation, stale responses, failures and draft protection');
+
+// An unchanged cached preview sends only its reference. A failed lookup keeps the editor usable.
+add[2]({ok:true});request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'v3'});
+function fetchCachedPreview(text) {
+  c.startRuleImport();element('rule-import-url').value='https://example.invalid/large.list';
+  c.fetchRuleList();
+  const read=request('fetch_rule_list');
+  assert.equal(read[1].cache_preview,true);
+  read[2]({ok:true,text,count:1800,preview_token:'a'.repeat(96)});
+}
+const largeText='DOMAIN,cache.example.invalid,DIRECT\n'.repeat(1900);
+fetchCachedPreview(largeText);
+c.applyRulePreview();add=request('batch_add_rules');
+assert.equal(add[1].preview_token,'a'.repeat(96));
+assert.equal(Object.hasOwn(add[1],'text'),false);
+assert.ok(JSON.stringify(add[1]).length<512);
+add[2]({ok:false,preview_unavailable:true,msg:'临时预览已过期，草稿已保留。'});
+request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'v4'});
+assert.match(element('rule-import-state').textContent,/已过期/);
+assert.equal(element('rule-batch').value,largeText);
+c.previewRuleChanges();c.applyRulePreview();add=request('batch_add_rules');
+assert.equal(add[1].text,largeText);
+assert.equal(Object.hasOwn(add[1],'preview_token'),false);
+add[2]({ok:true});request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'v5'});
+fetchCachedPreview(largeText);
+element('rule-batch').value='DOMAIN,edited.invalid,DIRECT';
+c.previewRuleChanges();c.applyRulePreview();add=request('batch_add_rules');
+assert.equal(add[1].text,'DOMAIN,edited.invalid,DIRECT');
+assert.equal(Object.hasOwn(add[1],'preview_token'),false);
+console.log('PASS: unchanged preview reuses token, edited and expired previews submit the retained draft');

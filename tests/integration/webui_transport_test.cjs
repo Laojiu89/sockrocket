@@ -78,12 +78,18 @@ console.log('PASS: UTF-8 JSON survives Softcenter field escaping');
 
 const preview={text:'DOMAIN,edited.invalid,DIRECT\n'.repeat(185),group:'测试'};
 const configBody = {config:Buffer.from('# 节点\n'.repeat(600)).toString('base64'), expected_revision:'r1'};
-for (const [action,payload] of [['batch_add_rules',preview],['save_config',configBody]]) {
+const snapshot=Array.from({length:60},(_,i)=>({group:'测试',rule_type:'domain',pattern:i+'.example.invalid',target:'direct'}));
+const groupEdit={group:'测试',expected_rules:snapshot,text:snapshot.map(r=>r.pattern).concat('new.invalid').join('\n')};
+for (const [action,payload] of [
+  ['batch_add_rules',preview],['replace_rule_group',groupEdit],
+  ['set_rule_group_enabled',{group:'测试',enabled:false,expected_rules:snapshot}],
+  ['add_node',{uri:'hy2://'+'x'.repeat(2200)+'@example.invalid:443'}],['save_config',configBody]
+]) {
   context.apiKscRequest(action,payload,()=>{});
   let staged='',packet=JSON.parse(requests.at(-1).body);
   const transfer=packet.params[1];
   while(packet.params[0]==='rpc_rule_part'){
-    assert.deepEqual(packet.params,['rpc_rule_part',transfer,String(staged.length)]);
+    assert.deepEqual(packet.params,['rpc_rule_part',transfer,String(staged.length),action]);
     const part=packet.fields['sockrocket_rpc_b64_'+transfer];
     assert.ok(part.length>0 && part.length<=2048);
     staged+=part;
@@ -98,14 +104,15 @@ console.log('PASS: rule and config requests are staged in order before commit');
 
 const configElements = {};
 const configRequests = [];
-let beforeUnload;
+let beforeUnload, catalogRefreshes = 0;
 const config = vm.createContext({
   srElement: id => configElements[id] ||= { value: '' },
-  srApi: (...args) => configRequests.push(args),
+  srApi: (...args) => configRequests.push(args), srRequestBodyLimit: context.srRequestBodyLimit,
   b64utf8: value => Buffer.from(value, 'base64').toString(),
   utf8b64: value => Buffer.from(value).toString('base64'),
   window: { addEventListener: (_, callback) => { beforeUnload = callback; } },
-  ruleWorkspaceDirty: () => false, dnsPolicyDirty: false, SR_PAGE_LOADED: {},
+  ruleWorkspaceDirty: () => false, dnsPolicyDirty: false, SR_PAGE_LOADED: {network:true}, SR_STATE: {page:'config'},
+  refreshNodeCatalogs() { catalogRefreshes++; },
   srShowMsg() {}, toastResp() {}, setTimeout() {}, refreshStatus() {}
 });
 vm.runInContext(source.slice(source.indexOf('var savedConfigText'), source.indexOf('function srCheckUpdate()')), config);
@@ -125,10 +132,13 @@ assert.equal(staleSave[1].expected_revision, 'r1');
 staleSave[2]({ok: false, msg: '配置已被其他操作更新'});
 assert.equal(editor.value, 'draft');
 assert.equal(config.savedConfigText, 'first');
+assert.equal(catalogRefreshes, 0, 'rejected edits do not invalidate saved data');
 config.srSaveConfig();
 configRequests.shift()[2]({ok: false, saved: true, revision: 'r2', msg: '服务重启失败'});
 assert.equal(config.savedConfigRevision, 'r2');
 assert.equal(config.savedConfigText, 'draft');
+assert.equal(catalogRefreshes, 1, 'persisted configuration invalidates node, group and subscription catalogs even after apply failure');
+assert.equal(config.SR_PAGE_LOADED.network, false);
 assert.match(configElements['config-state'].textContent, /重启失败/);
 config.dnsPolicyDirty = true;
 let prevented = false;
@@ -163,7 +173,7 @@ async function testConfigFiles() {
   assert.equal(input.value, '');
   assert.equal(editor.value, 'local edits');
   config.confirm = () => true;
-  for (const file of [new Blob([]), new Blob([Uint8Array.of(0xff)]), {size:1024*1024}]) {
+  for (const file of [new Blob([]), new Blob([Uint8Array.of(0xff)]), {size:6*1024*1024}]) {
     await config.srImportConfig({files:[file]});
     assert.equal(editor.value, 'local edits');
   }
@@ -180,10 +190,57 @@ async function testConfigFiles() {
   assert.equal(editor.value, '# 节点\r\nnodes: []\r\n');
   assert.equal(configRequests.length, 0);
   config.srSaveConfig();
-  const [saveAction, body] = configRequests.shift();
+  const [saveAction, body, restoreSmall] = configRequests.shift();
   assert.equal(saveAction, 'save_config');
   assert.equal(body.expected_revision, 'r2');
   assert.equal(Buffer.from(body.config, 'base64').toString(), editor.value);
-  console.log('PASS: file download, staged import, invalid files and concurrent edits');
+  restoreSmall({ok:true,saved:true,revision:'small'});
+  const large = Buffer.from('rules:\n' + Array.from({length:24000},(_,i) =>
+    '  - {group: Large, rule_type: domain, pattern: n' + i + '.example.invalid, target: direct, enabled: true}\n').join(''));
+  assert.ok(large.length > 2 * 1024 * 1024);
+  config.srDownloadConfig();
+  configRequests.shift()[2]({config_base64:large.toString('base64')});
+  assert.deepEqual(Buffer.from(await blob.arrayBuffer()), large);
+  await config.srImportConfig({files:[blob],value:'selected'});
+  assert.equal(editor.value, large.toString());
+  config.srSaveConfig();
+  const restore=configRequests.shift();
+  assert.equal(restore[0], 'save_config');
+  assert.deepEqual(Buffer.from(restore[1].config,'base64'), large);
+  console.log('PASS: file download, staged import, large rule backup restore, invalid files and concurrent edits');
 }
 testConfigFiles().catch(error => { console.error(error); process.exitCode = 1; });
+
+const nodeElements = {}, nodeRequests = [], nodeNotices = [];
+let refreshedNodes = 0;
+const nodeForm = vm.createContext({
+  srElement: id => nodeElements[id] ||= {value:'', focus() {}},
+  srShowMsg: (message, kind) => nodeNotices.push([message, kind]),
+  srApi: (...args) => nodeRequests.push(args),
+  refreshNodeCatalogs: () => refreshedNodes++, refreshStatus() {}
+});
+vm.runInContext(source.slice(source.indexOf('function addNodeFromUri()'), source.indexOf('function delNode(')), nodeForm);
+nodeForm.addNodeFromUri();
+assert.equal(nodeRequests.length, 0);
+const uriInput = nodeElements['an-uri'];
+uriInput.value = 'hy2://key@node.example.invalid#first';
+nodeForm.addNodeFromUri();
+nodeForm.addNodeFromUri();
+assert.equal(nodeRequests.length, 1);
+const firstAdd = nodeRequests.shift();
+assert.equal(firstAdd[0], 'add_node');
+assert.deepEqual({...firstAdd[1]}, {uri:uriInput.value});
+assert.equal(nodeElements['an-submit'].disabled, true);
+uriInput.value = 'vless://another-edited-draft';
+firstAdd[2]({ok:true});
+assert.equal(refreshedNodes, 1);
+assert.equal(uriInput.value, 'vless://another-edited-draft');
+nodeForm.addNodeFromUri();
+nodeRequests.shift()[3]({error_code:'timeout'});
+assert.equal(uriInput.value, 'vless://another-edited-draft');
+assert.equal(nodeNotices.at(-1)[1], 'err');
+assert.equal(nodeElements['an-uri-submit'].disabled, false);
+nodeForm.addNodeFromUri();
+nodeRequests.shift()[2]({ok:true});
+assert.equal(uriInput.value, '');
+console.log('PASS: single-node share links keep edited drafts, suppress double submits and clear credentials on success');

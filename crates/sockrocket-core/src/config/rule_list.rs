@@ -5,9 +5,9 @@ use anyhow::{Context, Result, ensure};
 
 use super::rules_batch::{format_rule_clash_line, parse_batch_rules_in_group};
 
-// Stay below the 1 MiB JSON request limit when the preview is submitted later.
-pub const MAX_RULE_LIST_BYTES: usize = 256 * 1024;
-pub const MAX_RULE_LIST_RULES: usize = 4096;
+// Keep downloaded and normalized text bounded on Merlin; the editable RPC envelope has a separate budget.
+pub const MAX_RULE_LIST_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_RULE_LIST_RULES: usize = 32_768;
 pub const RULE_LIST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug)]
@@ -32,10 +32,7 @@ pub fn validate_rule_list_url(input: &str) -> Result<()> {
 /// Produce explicit actions and remove group directives. Remote text must not
 /// redirect an import to another group. Nothing is persisted here.
 pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleListPreview> {
-    ensure!(
-        text.len() <= MAX_RULE_LIST_BYTES,
-        "规则列表超过 256 KiB 限制"
-    );
+    ensure!(text.len() <= MAX_RULE_LIST_BYTES, "规则列表超过 2 MiB 限制");
     let text = text.trim_start_matches('\u{feff}');
     ensure!(
         text.lines()
@@ -46,7 +43,7 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
             .take(MAX_RULE_LIST_RULES + 1)
             .count()
             <= MAX_RULE_LIST_RULES,
-        "一次最多导入 4096 条规则"
+        "一次最多导入 32768 条规则"
     );
     // Keep original line numbers for errors, and keep omissions visible in the
     // editable preview even for clients that only display its text.
@@ -84,7 +81,7 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
     ensure!(!parsed.rules.is_empty(), "链接中没有可导入的规则");
     ensure!(
         parsed.rules.len() <= MAX_RULE_LIST_RULES,
-        "一次最多导入 4096 条规则"
+        "一次最多导入 32768 条规则"
     );
     ensure!(
         parsed.rules.iter().all(|r| r.is_global_destination()),
@@ -98,7 +95,7 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
         .join("\n");
     ensure!(
         text.len() <= MAX_RULE_LIST_BYTES,
-        "展开后的规则列表超过 256 KiB 限制"
+        "展开后的规则列表超过 2 MiB 限制"
     );
     Ok(RuleListPreview {
         text,
@@ -153,7 +150,7 @@ async fn download(url: &str, socks: Option<SocketAddr>) -> Result<Vec<u8>> {
         response
             .content_length()
             .is_none_or(|n| n <= MAX_RULE_LIST_BYTES as u64),
-        "规则列表超过 256 KiB 限制"
+        "规则列表超过 2 MiB 限制"
     );
     let mut bytes = Vec::new();
     while let Some(chunk) = response
@@ -164,7 +161,7 @@ async fn download(url: &str, socks: Option<SocketAddr>) -> Result<Vec<u8>> {
     {
         ensure!(
             chunk.len() <= MAX_RULE_LIST_BYTES.saturating_sub(bytes.len()),
-            "规则列表超过 256 KiB 限制"
+            "规则列表超过 2 MiB 限制"
         );
         bytes.extend_from_slice(&chunk);
     }
@@ -205,6 +202,34 @@ mod tests {
                 .contains("第 2 行")
         );
         assert!(preview_rule_list("PROCESS-NAME,example", "proxy", "Messaging").is_err());
+    }
+
+    #[test]
+    fn large_cidr_list_keeps_ipv4_and_ipv6_and_counts_skipped_asns() {
+        use std::fmt::Write;
+        let mut raw = String::new();
+        for n in 0..12_500 {
+            writeln!(raw, "IP-CIDR,10.{}.{}.0/24,no-resolve", n / 256, n % 256).unwrap();
+        }
+        for n in 0..5_428 {
+            writeln!(raw, "IP-CIDR6,2001:db8:{n:x}::/48,no-resolve").unwrap();
+        }
+        for n in 0..5_076 {
+            writeln!(raw, "IP-ASN,{},no-resolve", n + 1).unwrap();
+        }
+        assert!(raw.len() > 256 * 1024);
+        let result = preview_rule_list(&raw, "direct", "国内").unwrap();
+        assert_eq!(result.count, 17_928);
+        assert_eq!(result.skipped["IP-ASN"], 5_076);
+        let parsed = parse_batch_rules_in_group(&result.text, "proxy", "国内");
+        assert!(parsed.errors.is_empty());
+        assert_eq!(parsed.rules.len(), result.count);
+        assert!(
+            parsed
+                .rules
+                .iter()
+                .all(|r| r.target == "direct" && r.group == "国内")
+        );
     }
 
     #[test]

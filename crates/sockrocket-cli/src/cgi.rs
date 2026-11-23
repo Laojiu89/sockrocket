@@ -22,6 +22,7 @@ mod network_settings;
 mod proxy_groups;
 mod route_trace;
 mod rule_presets;
+mod rule_preview_cache;
 mod runtime;
 mod speedtest_jobs;
 mod storage;
@@ -81,7 +82,7 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     let post = if method == "POST" {
-        read_post_body().and_then(|body| {
+        read_post_body(request_body_limit(&action)).and_then(|body| {
             parse_post_body(&body).map_err(|error| {
                 let mut out = request_error(
                     "request_body_invalid",
@@ -130,7 +131,15 @@ fn query_param(name: &str) -> Option<String> {
     None
 }
 
-const MAX_CGI_BODY: u64 = 1024 * 1024; // 1 MiB — same cap as the HTTP API bridge
+fn request_body_limit(action: &str) -> u64 {
+    match action {
+        // The backup is base64 inside JSON, so about 6 MiB of YAML fits.
+        "save_config" => 8 * 1024 * 1024,
+        // The editable preview may contain 2 MiB plus JSON escaping and framing.
+        "batch_add_rules" | "replace_rule_group" => 4 * 1024 * 1024,
+        _ => 1024 * 1024,
+    }
+}
 
 fn request_error(code: &str, cause: &str, message: &str) -> J {
     json!({"ok":false,"error_code":code,"stage":"read_request","cause":cause,
@@ -145,13 +154,13 @@ fn parse_post_body(body: &str) -> serde_json::Result<J> {
     }
 }
 
-fn read_post_body() -> std::result::Result<String, J> {
+fn read_post_body(decoded_limit: u64) -> std::result::Result<String, J> {
     let encoded = env::var("SOCKROCKET_LOCAL_RPC").as_deref() == Ok("1")
         && env::var("SOCKROCKET_RPC_ENCODING").as_deref() == Ok("base64");
     let limit = if encoded {
-        MAX_CGI_BODY.div_ceil(3) * 4
+        decoded_limit.div_ceil(3) * 4
     } else {
-        MAX_CGI_BODY
+        decoded_limit
     };
     let length = env::var("CONTENT_LENGTH")
         .ok()
@@ -161,7 +170,7 @@ fn read_post_body() -> std::result::Result<String, J> {
         let mut error = request_error(
             "request_body_too_large",
             "TooLarge",
-            "Request body exceeds the 1 MiB decoded limit",
+            "Request body exceeds the limit for this operation",
         );
         error["hint"] = json!("缩小单次提交内容后重试。");
         error
@@ -199,7 +208,7 @@ fn read_post_body() -> std::result::Result<String, J> {
                 "Request body encoding is invalid",
             )
         })?;
-        if buf.len() as u64 > MAX_CGI_BODY {
+        if buf.len() as u64 > decoded_limit {
             return Err(too_large());
         }
     }
@@ -1143,6 +1152,7 @@ fn act_add_sub(post: &J) -> J {
                     sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
                         url: url.to_string(),
                         revision,
+                        skipped_entries: report.skipped_entries,
                     },
                     nodes,
                 )],
@@ -1152,15 +1162,14 @@ fn act_add_sub(post: &J) -> J {
                 Ok(commit) if commit.applied_urls.iter().any(|source| source == url) => {
                     let total = commit.config.nodes.len();
                     subscription_jobs::progress(1, 1, "applying");
-                    if let Err(error) = run_sh("restart") {
-                        return err_msg(error.to_string());
-                    }
-                    json!({
+                    apply_saved_subscription(json!({
                         "ok": true,
-                        "msg": format!("已导入 {fetched} 个节点，共 {total} 个，设置已应用{warning}"),
+                        "msg": format!("已导入 {fetched} 个节点，共 {total} 个{warning}"),
                         "node_count": total,
+                        "skipped_entries": commit.skipped_entries,
+                        "retained_entries": commit.retained_entries,
                         "compatibility_notes": compatibility_notes
-                    })
+                    }))
                 }
                 Ok(_) => json!({"ok":false,"error_code":"subscription_removed",
                     "msg":"订阅在下载期间被删除或已由另一任务更新；过期下载已丢弃，现有节点保持不变"}),
@@ -1298,16 +1307,11 @@ fn act_update_subs() -> J {
             }
             Ok(report) => {
                 compatibility_notes.extend(report.compatibility_notes);
-                if report.skipped_entries > 0 {
-                    errors.push(format!(
-                        "{} URI entries were not imported (unsupported options or invalid entries)",
-                        report.skipped_entries
-                    ));
-                }
                 refreshed.push((
                     sockrocket_core::config::storage::SubscriptionRefreshSnapshot {
                         url,
                         revision: get("refresh_revision"),
+                        skipped_entries: report.skipped_entries,
                     },
                     report.nodes,
                 ));
@@ -1365,11 +1369,14 @@ fn act_update_subs() -> J {
             "{dropped} 个订阅在下载期间被删除或已由另一任务更新，其过期节点已丢弃"
         ));
     }
+    if commit.skipped_entries > 0 {
+        errors.push(format!(
+            "{} 条节点无效或不兼容，保留了 {} 条未匹配的旧节点记录",
+            commit.skipped_entries, commit.retained_entries
+        ));
+    }
     let total = commit.config.nodes.len();
     subscription_jobs::progress(subs.len(), subs.len(), "applying");
-    if let Err(error) = run_sh("restart") {
-        return err_msg(error.to_string());
-    }
     let warn = if errors.is_empty() {
         String::new()
     } else {
@@ -1377,14 +1384,38 @@ fn act_update_subs() -> J {
     };
     compatibility_notes.sort_unstable();
     compatibility_notes.dedup();
-    json!({
+    apply_saved_subscription(json!({
         "ok": true,
-        "msg": format!("已更新 {fetched} 个节点，共 {total} 个，设置已应用{warn}"),
+        "msg": format!("已更新 {fetched} 个节点，共 {total} 个{warn}"),
         "node_count": total,
         "compatibility_notes": compatibility_notes,
         "skipped_subscriptions": skipped_subscriptions,
+        "skipped_entries": commit.skipped_entries,
+        "retained_entries": commit.retained_entries,
         "warnings": errors
-    })
+    }))
+}
+
+fn apply_saved_subscription(mut result: J) -> J {
+    result["saved"] = json!(true);
+    let outcome = if sockrocket_dir().join("stopped").exists() {
+        result["applied"] = json!(false);
+        "服务已停止，下次启动后生效".to_owned()
+    } else if let Err(error) = run_sh("restart") {
+        result["ok"] = json!(false);
+        result["applied"] = json!(false);
+        result["error_code"] = json!("subscription_apply_failed");
+        result["stage"] = json!("applying");
+        format!("节点已保存，但应用失败：{error}")
+    } else {
+        result["applied"] = json!(true);
+        "设置已应用".to_owned()
+    };
+    result["msg"] = json!(format!(
+        "{}；{outcome}",
+        result["msg"].as_str().unwrap_or_default()
+    ));
+    result
 }
 
 fn socks_port() -> u16 {
@@ -1417,13 +1448,13 @@ fn latency_via_active_socks() -> Result<u32, String> {
         Duration::from_secs(15),
     ) {
         Ok((200 | 204, _)) => Ok(start.elapsed().as_millis().min(u32::MAX as u128) as u32),
-        _ => Err("Connection failed or timed out".into()),
+        _ => Err("出口延迟检测失败或超时。".into()),
     }
 }
 
 fn act_speedtest() -> J {
     if !is_running() {
-        return json!({"ok": false, "latency": -1, "msg": "Sockrocket is not running; start the service first"});
+        return json!({"ok": false, "latency": -1, "msg": "服务已停止，请先启动服务再测速。"});
     }
     match latency_via_active_socks() {
         Ok(ms) => json!({"ok": true, "latency": ms}),
@@ -1433,7 +1464,7 @@ fn act_speedtest() -> J {
 
 fn act_ip_check() -> J {
     if !is_running() {
-        return json!({"ok": false, "ip": "", "country": "", "msg": "Sockrocket is not running; start the service first"});
+        return json!({"ok": false, "ip": "", "country": "", "msg": "服务已停止，请先启动服务再检查出口 IP。"});
     }
     let parsed: J = match crate::proxy_http::get(
         socks_port(),
@@ -1447,7 +1478,7 @@ fn act_ip_check() -> J {
     let ip = parsed.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let country = parsed.get("country").and_then(|v| v.as_str()).unwrap_or("");
     if ip.is_empty() {
-        json!({"ok": false, "ip": "", "country": "", "msg": "IP check failed; make sure the proxy is running"})
+        json!({"ok": false, "ip": "", "country": "", "msg": "未能获取出口 IP，请检查服务和出口连接。"})
     } else {
         json!({"ok": true, "ip": ip, "country": country})
     }
@@ -1533,6 +1564,26 @@ fn act_speedtest_node(post: &J) -> J {
 }
 
 fn act_add_node(post: &J) -> J {
+    if let Some(uri) = post.get("uri") {
+        let uri = uri.as_str().unwrap_or("").trim();
+        if uri.starts_with("http://") || uri.starts_with("https://") {
+            return err_msg("请在「订阅」页添加订阅地址。这里需要单个节点的分享链接。");
+        }
+        if uri.is_empty() || uri.contains(['\r', '\n']) {
+            return err_msg("请粘贴一个完整的节点分享链接。");
+        }
+        // Parser errors can contain part of the private link.
+        let Ok(node) = sockrocket_core::parse_proxy_uri(uri) else {
+            return err_msg("无法解析节点分享链接，请检查协议、认证信息和链接参数。");
+        };
+        if let Err(message) = validate_manual_node(&node) {
+            return err_msg(message);
+        }
+        return match serde_yaml::to_value(&node) {
+            Ok(value) => append_manual_node(&node.name, value),
+            Err(_) => err_msg("无法生成节点配置。"),
+        };
+    }
     let get = |k: &str| {
         post.get(k)
             .and_then(|v| v.as_str())
@@ -1562,6 +1613,14 @@ fn act_add_node(post: &J) -> J {
     };
     let mut pm = Mapping::new();
     pm.insert(ykey("type"), Y::String(proto.to_string()));
+    // Match the share-link defaults without changing how older YAML nodes are read.
+    if matches!(proto, "shadowsocks" | "vless" | "tuic" | "trojan" | "vmess") {
+        let udp = post
+            .get("udp")
+            .and_then(J::as_bool)
+            .unwrap_or(proto != "vmess");
+        pm.insert(ykey("udp"), Y::Bool(udp));
+    }
     match proto {
         "shadowsocks" => {
             pm.insert(
@@ -1593,7 +1652,13 @@ fn act_add_node(post: &J) -> J {
             pm.insert(ykey("username"), Y::String(get("username")));
             pm.insert(ykey("password"), Y::String(password));
         }
-        "anytls" | "trojan" | "hysteria2" => {
+        "hysteria2" => {
+            return match manual_hysteria2_node(post, &name, &server, port, password) {
+                Ok(node) => append_manual_node(&name, node),
+                Err(error) => err_msg(error.to_string()),
+            };
+        }
+        "anytls" | "trojan" => {
             pm.insert(ykey("password"), Y::String(password));
         }
         "tuic" => {
@@ -1643,28 +1708,112 @@ fn act_add_node(post: &J) -> J {
         .unwrap();
         node.insert(ykey("transport"), transport);
     }
-    if matches!(proto, "mieru" | "anytls" | "wireguard") {
-        let valid = sockrocket_core::Node::from_yaml_value(Y::Mapping(node.clone()))
-            .ok()
-            .is_some_and(|node| {
-                sockrocket_core::proxy::factory::create_outbound_unwarmed(&node).is_ok()
-            });
-        if !valid {
-            return err_msg("Invalid protocol credentials, endpoint or transport");
-        }
+    let Ok(parsed) = sockrocket_core::Node::from_yaml_value(Y::Mapping(node.clone())) else {
+        return err_msg("节点配置无效，请检查协议参数。");
+    };
+    if let Err(message) = validate_manual_node(&parsed) {
+        return err_msg(message);
     }
 
+    append_manual_node(&name, Y::Mapping(node))
+}
+
+fn manual_hysteria2_node(
+    post: &J,
+    name: &str,
+    server: &str,
+    port: u16,
+    password: String,
+) -> Result<Y> {
+    let server = match server.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        Some(ip) => ip
+            .parse::<std::net::Ipv6Addr>()
+            .context("Invalid IPv6 server address")?
+            .to_string(),
+        None => {
+            anyhow::ensure!(
+                server.parse::<std::net::IpAddr>().is_ok()
+                    || sockrocket_core::config::dns::valid_domain(
+                        server.strip_suffix('.').unwrap_or(server)
+                    ),
+                "Invalid Hysteria2 server address"
+            );
+            server.into()
+        }
+    };
+    let mut options: std::collections::HashMap<String, String> = match post.get("hysteria2") {
+        Some(value) => {
+            serde_json::from_value(value.clone()).context("Invalid Hysteria2 options")?
+        }
+        None => Default::default(),
+    };
+    if let Some(sni) = post
+        .get("sni")
+        .and_then(J::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        options.insert("sni".into(), sni.into());
+    }
+    if post.get("skip_cert_verify").and_then(J::as_bool) == Some(true) {
+        options.insert("insecure".into(), "1".into());
+    }
+    let node = sockrocket_core::config::v2ray::hysteria2_node(
+        name.into(),
+        server,
+        port,
+        password,
+        &options,
+    )?;
+    sockrocket_core::create_outbound_unwarmed(&node)?;
+    Ok(serde_yaml::to_value(node)?)
+}
+
+fn validate_manual_node(node: &sockrocket_core::Node) -> Result<(), &'static str> {
+    use sockrocket_core::ProxyProtocol;
+
+    if node.server.trim().is_empty() || node.port == 0 {
+        return Err("请填写服务器和有效端口。");
+    }
+    match &node.protocol {
+        ProxyProtocol::Shadowsocks {
+            cipher, password, ..
+        } if password.is_empty()
+            && !cipher.eq_ignore_ascii_case("none")
+            && !cipher.eq_ignore_ascii_case("plain") =>
+        {
+            return Err("请填写 Shadowsocks 密码或预共享密钥。");
+        }
+        ProxyProtocol::Trojan { password, .. } if password.is_empty() => {
+            return Err("请填写 Trojan 密码。");
+        }
+        _ => {}
+    }
+    // Only construct the connector. Adding a node must work with the service stopped.
+    // Connector errors can include submitted values; keep credentials out of responses.
+    sockrocket_core::create_outbound_unwarmed(node)
+        .map(|_| ())
+        .map_err(|_| match &node.protocol {
+            ProxyProtocol::Shadowsocks { .. } => "请检查 Shadowsocks 加密方式、密钥和插件参数。",
+            ProxyProtocol::VMess { .. } => "请检查 VMess UUID、加密方式和传输参数。",
+            ProxyProtocol::VLess { .. } => "请检查 VLESS UUID 和传输参数。",
+            ProxyProtocol::Tuic { .. } => "请检查 TUIC UUID 和连接参数。",
+            _ => "节点配置无效，请检查协议凭据和连接参数。",
+        })
+}
+
+fn append_manual_node(name: &str, node: Y) -> J {
     let Ok(mut map) = load_conf() else {
-        return err_msg("Config file not found");
+        return err_msg("无法读取配置，请刷新后重试。");
     };
     let mut seq = match map.remove("nodes") {
         Some(Y::Sequence(s)) => s,
-        _ => Vec::new(),
+        None | Some(Y::Null) => Vec::new(),
+        Some(_) => return err_msg("现有节点列表格式无效，请先修复配置。"),
     };
-    seq.push(Y::Mapping(node));
+    seq.push(node);
     map.insert(ykey("nodes"), Y::Sequence(seq));
     match save_conf(&map) {
-        Ok(()) => ok_msg(format!("Node added: {name}")),
+        Ok(()) => ok_msg(format!("已添加节点「{name}」")),
         Err(e) => save_failed(&e),
     }
 }
@@ -2999,7 +3148,12 @@ fn act_fetch_rule_list(post: &J) -> J {
     })();
     match result {
         Ok(preview) => {
-            json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped})
+            let token = if post["cache_preview"].as_bool() == Some(true) {
+                rule_preview_cache::store(&preview.text)
+            } else {
+                None
+            };
+            json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped,"preview_token":token})
         }
         Err(error) => err_msg(format!("{error:#}")),
     }
@@ -3024,6 +3178,7 @@ fn parse_pasted_rules(
                     | "DOMAIN-SUFFIX"
                     | "DOMAIN-KEYWORD"
                     | "IP-CIDR"
+                    | "IP-CIDR6"
                     | "GEOIP"
                     | "DST-PORT"
                     | "PORT"
@@ -3048,9 +3203,26 @@ fn parse_pasted_rules(
 
 /// Batch paste / import: multiline text → many rules (same parser as desktop GUI).
 fn act_batch_add_rules(post: &J) -> J {
-    let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let cached;
+    let text = if let Some(token) = post.get("preview_token") {
+        if post.get("text").is_some() || post["group_only"].as_bool() != Some(true) {
+            return err_msg("缓存预览只可用于追加链接规则，请重新预览。");
+        }
+        let Some(text) = token
+            .as_str()
+            .and_then(|key| rule_preview_cache::load(key).ok())
+        else {
+            return json!({"ok":false,"preview_unavailable":true,"msg":"临时预览已过期或不可用，草稿已保留。请重新读取链接，或再次确认以提交编辑框中的规则。"});
+        };
+        cached = text;
+        cached.as_str()
+    } else if let Some(text) = post.get("text").and_then(J::as_str) {
+        text
+    } else {
+        return err_msg("路由器未收到规则文本，请保留草稿并重新提交。");
+    };
     if text.trim().is_empty() {
-        return err_msg("Paste one or more rules first");
+        return err_msg("请输入至少一条规则，每行一条。");
     }
     let default_target = post
         .get("target")
@@ -3097,6 +3269,22 @@ fn act_batch_add_rules(post: &J) -> J {
         Ok(value) => value,
         Err(error) => return err_msg(&error),
     };
+    fn priority_key(rule: &sockrocket_core::RoutingRule) -> (&str, &str, &str, &str) {
+        (
+            rule.group.trim(),
+            rule_kind(&rule.rule_type),
+            &rule.pattern,
+            &rule.source,
+        )
+    }
+    let mut existing_priorities = std::collections::HashMap::new();
+    if post.get("priority").is_none() {
+        for rule in &existing {
+            existing_priorities
+                .entry(priority_key(rule))
+                .or_insert(rule.priority);
+        }
+    }
     for rule in &mut incoming {
         if !includes_group_rule(post, rule) {
             return err_msg("默认出口请在设备分流策略中设置");
@@ -3116,15 +3304,10 @@ fn act_batch_add_rules(post: &J) -> J {
         rule.priority = if post.get("priority").is_some() {
             priority
         } else {
-            existing
-                .iter()
-                .find(|r| {
-                    r.group.trim() == rule.group.trim()
-                        && rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
-                        && r.pattern == rule.pattern
-                        && r.source == rule.source
-                })
-                .map_or(0, |r| r.priority)
+            existing_priorities
+                .get(&priority_key(rule))
+                .copied()
+                .unwrap_or(0)
         };
     }
     let n_in = incoming.len();
@@ -3317,6 +3500,9 @@ fn act_set_rule_group_enabled(post: &J) -> J {
         return err_msg("Config file not found");
     };
     let mut rules = load_routing_rules(&map);
+    if post.get("revision").is_some() && !proxy_groups::revision_matches(&map, &rules, post) {
+        return err_msg("规则或关联配置已变化，请重新打开分组并确认修改。");
+    }
     if rules.len() != conf_seq(&map, "rules").len() {
         return err_msg("规则配置损坏，请先修复后再修改分组状态");
     }
@@ -3377,7 +3563,11 @@ fn act_replace_rule_group(post: &J) -> J {
     if !proxy_groups::valid_target(target) {
         return err_msg("Invalid target action (direct / proxy / reject)");
     }
-    let text = post.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    let text = match post.get("text").and_then(J::as_str) {
+        Some(text) => text,
+        None if matches!(rule_type, "match" | "final") => "",
+        None => return err_msg("路由器未收到规则文本，请保留草稿并重新提交。"),
+    };
     let enabled = post
         .get("enabled")
         .and_then(|v| v.as_bool())
@@ -3389,7 +3579,7 @@ fn act_replace_rule_group(post: &J) -> J {
 
     let mut incoming = if text.trim().is_empty() {
         if !matches!(rule_type, "match" | "final") {
-            return err_msg("Paste the group's patterns first");
+            return err_msg("请输入至少一条分组规则，每行一条。");
         }
         match sockrocket_core::make_typed_rule("match", "*", target, &new_group) {
             Ok(rule) => vec![rule],
@@ -3409,6 +3599,9 @@ fn act_replace_rule_group(post: &J) -> J {
         return err_msg("Config file not found");
     };
     let mut rules = load_routing_rules(&map);
+    if post.get("revision").is_some() && !proxy_groups::revision_matches(&map, &rules, post) {
+        return err_msg("规则或关联配置已变化，请重新打开分组并确认修改。");
+    }
     let members: Vec<_> = rules
         .iter()
         .filter(|r| includes_group_rule(post, r) && same_rule_group(&r.group, &old_group))
@@ -3433,16 +3626,26 @@ fn act_replace_rule_group(post: &J) -> J {
     };
     let default_enabled = members.iter().any(|r| r.enabled);
     let default_priority = members[0].priority;
+    let mut previous_by_key = std::collections::HashMap::with_capacity(members.len());
+    for &rule in &members {
+        previous_by_key
+            .entry((
+                rule_kind(&rule.rule_type),
+                rule.pattern.as_str(),
+                rule.source.as_str(),
+            ))
+            .or_insert(rule);
+    }
     for rule in &mut incoming {
         rule.group.clone_from(&new_group);
         if post.get("source").is_some() || rule.source.is_empty() {
             rule.source.clone_from(&source);
         }
-        let previous = members.iter().find(|r| {
-            rule_kind(&r.rule_type) == rule_kind(&rule.rule_type)
-                && r.pattern == rule.pattern
-                && r.source == rule.source
-        });
+        let previous = previous_by_key.get(&(
+            rule_kind(&rule.rule_type),
+            rule.pattern.as_str(),
+            rule.source.as_str(),
+        ));
         rule.enabled = if post.get("enabled").is_some() {
             enabled
         } else {
@@ -4008,19 +4211,7 @@ mod tests {
     }
 
     async fn parse_test_request(bytes: Vec<u8>) -> Option<ApiRequest> {
-        use tokio::io::AsyncWriteExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::spawn(async move {
-            let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
-            // Invalid headers may cause the server to close early.
-            let _ = socket.write_all(&bytes).await;
-            let _ = socket.shutdown().await;
-        });
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let result = read_request(&mut socket).await;
-        client.await.unwrap();
-        result
+        read_request(&mut bytes.as_slice()).await
     }
 
     #[tokio::test]
@@ -4050,6 +4241,25 @@ mod tests {
         .unwrap();
         assert_eq!(valid.action, "status");
         assert_eq!(valid.body, "{}");
+    }
+
+    #[tokio::test]
+    async fn api_enforces_each_action_body_limit() {
+        for (action, mib) in [
+            ("save_config", 8),
+            ("batch_add_rules", 4),
+            ("replace_rule_group", 4),
+            ("add_node", 1),
+        ] {
+            let limit = mib * 1024 * 1024;
+            for size in [limit, limit + 1] {
+                let mut request =
+                    format!("POST /api?action={action} HTTP/1.1\r\nContent-Length: {size}\r\n\r\n")
+                        .into_bytes();
+                request.resize(request.len() + size, b' ');
+                assert_eq!(parse_test_request(request).await.is_some(), size == limit);
+            }
+        }
     }
 
     #[tokio::test]
@@ -4925,6 +5135,53 @@ dns_direct_domains:
     }
 
     #[test]
+    fn add_node_from_share_link_preserves_transport_and_rejects_bad_links() {
+        let _env = TestEnv::new(SAMPLE);
+        let link = "hy2://test-auth@192.0.2.7:443/?sni=cert.example.invalid&obfs=salamander&obfs-password=test-obfs-key#Share";
+        assert_eq!(dispatch("add_node", &json!({"uri":link}))["ok"], true);
+        let config = load_app_config().unwrap();
+        let added = config.nodes.last().unwrap();
+        let expected = sockrocket_core::parse_proxy_uri(link).unwrap();
+        assert_eq!(
+            serde_yaml::to_value(added).unwrap(),
+            serde_yaml::to_value(expected).unwrap()
+        );
+        let other = "vless://00000000-0000-0000-0000-000000000001@node.example.invalid:443?security=tls&type=ws&path=%2Fsocket#WS";
+        assert_eq!(dispatch("add_node", &json!({"uri":other}))["ok"], true);
+        let before = fs::read(conf_path()).unwrap();
+        for invalid in [
+            "https://sub.example.invalid/?token=private-token",
+            "bad-private-token",
+            "trojan://node.example.invalid",
+            "vless://private-token@node.example.invalid:443",
+        ] {
+            let response = dispatch("add_node", &json!({"uri":invalid}));
+            assert_eq!(response["ok"], false);
+            assert!(!response.to_string().contains("private-token"));
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn saved_subscription_reports_stopped_and_failed_apply() {
+        let env = TestEnv::new(SAMPLE);
+        let result = json!({"ok":true,"msg":"已保存 2 个节点","node_count":2,"skipped_entries":1});
+        fs::write(env.dir.join("stopped"), "manual").unwrap();
+        let stopped = apply_saved_subscription(result.clone());
+        assert_eq!(stopped["ok"], true);
+        assert_eq!(stopped["applied"], false);
+        assert!(stopped["msg"].as_str().unwrap().contains("下次启动"));
+        fs::remove_file(env.dir.join("stopped")).unwrap();
+        fs::write(env.dir.join("scripts/sockrocket.sh"), "#!/bin/sh\nexit 1\n").unwrap();
+        let failed = apply_saved_subscription(result);
+        assert_eq!(failed["error_code"], "subscription_apply_failed");
+        assert_eq!(failed["saved"], true);
+        assert_eq!(failed["applied"], false);
+        assert_eq!(failed["node_count"], 2);
+        assert_eq!(failed["skipped_entries"], 1);
+    }
+
+    #[test]
     fn set_node_edits_and_preserves_merlin_keys() {
         let _env = TestEnv::new(SAMPLE);
         let r = act_set_node(&json!({"index": 1}));
@@ -5095,16 +5352,17 @@ dns_direct_domains:
     #[test]
     fn add_node_builds_valid_tagged_protocol() {
         let _env = TestEnv::new(SAMPLE);
+        let uuid = "00000000-0000-4000-8000-000000000001";
         for (proto, extra) in [
             (
                 "shadowsocks",
                 json!({"password": "pw", "cipher": "aes-256-gcm"}),
             ),
-            ("vmess", json!({"uuid": "u", "cipher": "auto"})),
-            ("vless", json!({"uuid": "u"})),
+            ("vmess", json!({"uuid": uuid, "cipher": "auto"})),
+            ("vless", json!({"uuid": uuid})),
             ("trojan", json!({"password": "pw"})),
             ("hysteria2", json!({"password": "pw"})),
-            ("tuic", json!({"uuid": "u", "password": "pw"})),
+            ("tuic", json!({"uuid": uuid, "password": "pw"})),
             (
                 "mieru",
                 json!({"username": "synthetic-private-username", "password":"synthetic-private-password"}),
@@ -5139,8 +5397,19 @@ dns_direct_domains:
         assert!(!d.to_string().contains("synthetic-private-password"));
         assert!(!d.to_string().contains("private_key"));
         let config: sockrocket_core::AppConfig = serde_yaml::from_str(&text).unwrap();
-        for node in config.nodes.iter().skip(8) {
+        assert!(
+            config.nodes[..2]
+                .iter()
+                .all(|node| !node.protocol.supports_udp())
+        );
+        for node in config.nodes.iter().skip(2) {
             assert!(sockrocket_core::create_outbound_unwarmed(node).is_ok());
+            assert_eq!(
+                node.protocol.supports_udp(),
+                !matches!(node.protocol.name(), "vmess" | "mieru"),
+                "manual UDP default for {}",
+                node.protocol.name()
+            );
         }
         let before = fs::read_to_string(conf_path()).unwrap();
         assert_eq!(
@@ -5150,6 +5419,87 @@ dns_direct_domains:
             false
         );
         assert_eq!(fs::read_to_string(conf_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn add_node_rejects_unusable_credentials_before_saving() {
+        let _env = TestEnv::new(SAMPLE);
+        let before = fs::read(conf_path()).unwrap();
+        let uuid = "00000000-0000-4000-8000-000000000001";
+        for (protocol, fields, hint) in [
+            ("ss", json!({}), "密码"),
+            (
+                "ss",
+                json!({"password":"private-fixture","cipher":"invalid"}),
+                "加密方式",
+            ),
+            ("trojan", json!({}), "密码"),
+            ("vless", json!({"uuid":"private-fixture"}), "UUID"),
+            ("vmess", json!({"uuid":"invalid"}), "UUID"),
+            ("vmess", json!({"uuid":uuid,"cipher":"invalid"}), "加密方式"),
+            (
+                "tuic",
+                json!({"uuid":"", "password":"private-fixture"}),
+                "UUID",
+            ),
+        ] {
+            let mut post = json!({"name":"test","server":"vpn.example.invalid","port":443,"protocol":protocol});
+            post.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let response = dispatch("add_node", &post);
+            assert_eq!(response["ok"], false);
+            assert!(response["msg"].as_str().unwrap().contains(hint));
+            assert!(!response.to_string().contains("private-fixture"));
+            assert_eq!(fs::read(conf_path()).unwrap(), before);
+        }
+        let ss_plain = json!({"name":"test","server":"vpn.example.invalid","port":443,"protocol":"ss","cipher":"none","password":""});
+        assert_eq!(dispatch("add_node", &ss_plain)["ok"], true);
+    }
+
+    #[test]
+    fn manual_hysteria2_matches_share_link_and_rejects_invalid_options_before_save() {
+        let _env = TestEnv::new(SAMPLE);
+        let pin = "ab".repeat(32);
+        let mut request = json!({
+            "protocol": "hy2", "name": "manual", "server": "[2001:db8::1]", "port": 443,
+            "password": "a@b:% &", "sni": "peer.invalid", "skip_cert_verify": true,
+            "hysteria2": {
+                "obfs":"salamander", "obfs-password":"a / b", "mport":"443,1000-1010",
+                "pinSHA256":pin, "alpn":"h3", "fp":"chrome", "upmbps":"2.5", "downmbps":"125",
+                "fastopen":"1"
+            }
+        });
+        let result = act_add_node(&request);
+        assert_eq!(result["ok"], true, "{result}");
+        let expected = sockrocket_core::parse_hysteria2_uri(&format!(
+            "hy2://a%40b%3A%25%20%26@[2001:db8::1]:443?sni=peer.invalid&insecure=1&obfs=salamander&obfs-password=a%20%2F%20b&mport=443,1000-1010&pinSHA256={pin}&alpn=h3&fp=chrome&upmbps=2.5&downmbps=125&fastopen=1#manual"
+        )).unwrap();
+        let config = load_app_config().unwrap();
+        let saved = config.nodes.last().unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        sockrocket_core::create_outbound_unwarmed(saved).unwrap();
+        let catalog = act_nodes(true).to_string();
+        assert!(!catalog.contains("a@b:% &") && !catalog.contains("a / b"));
+
+        let unchanged = fs::read(conf_path()).unwrap();
+        for invalid in [
+            json!({"obfs":"gecko"}),
+            json!({"pinSHA256":"malformed"}),
+            json!({"mport":"600-500"}),
+            json!({"fp":"chrome", "alpn":"hysteria"}),
+            json!({"fastopen":"maybe"}),
+        ] {
+            request["hysteria2"] = invalid;
+            assert_eq!(act_add_node(&request)["ok"], false);
+        }
+        request["hysteria2"] = json!({});
+        request["password"] = json!("");
+        assert_eq!(act_add_node(&request)["ok"], false);
+        assert_eq!(fs::read(conf_path()).unwrap(), unchanged);
     }
 
     #[test]
@@ -5991,6 +6341,31 @@ device_rule_groups:
     }
 
     #[test]
+    fn group_replacement_and_toggling_check_the_presented_revision() {
+        let _env = TestEnv::new(&SAMPLE.replace(
+            "rules: []",
+            "rules:\n  - {rule_type: domain, group: Video, pattern: tv.invalid, target: proxy, name: TV, priority: 20}",
+        ));
+        let revision = || route_trace::rules_revision(&load_conf().unwrap());
+        let old = revision();
+        let mut toggle = json!({"group":"Video", "enabled":false, "revision":old});
+        assert_eq!(act_set_rule_group_enabled(&toggle)["ok"], true);
+        let before = fs::read(conf_path()).unwrap();
+        let mut edit = json!({"group":"Video","text":"DOMAIN,tv.invalid,DIRECT","revision":old});
+        assert_eq!(act_replace_rule_group(&edit)["ok"], false);
+        toggle["enabled"] = json!(true);
+        assert_eq!(act_set_rule_group_enabled(&toggle)["ok"], false);
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        edit["revision"] = json!(revision());
+        assert_eq!(act_replace_rule_group(&edit)["ok"], true);
+        let row = &load_routing_rules(&load_conf().unwrap())[0];
+        assert_eq!(row.name, "TV");
+        assert_eq!(row.priority, 20);
+        assert!(!row.enabled);
+        assert_eq!(row.target, "direct");
+    }
+
+    #[test]
     fn deleting_a_group_only_removes_confirmed_rules_and_links() {
         let _env = TestEnv::new(&SAMPLE.replace(
             "rules: []",
@@ -6148,6 +6523,50 @@ device_rule_groups:
     }
 
     #[test]
+    fn a_typed_ipv6_paste_overrides_the_domain_dropdown_for_add_and_edit() {
+        let _env = TestEnv::new(SAMPLE);
+        let group = "IPv6";
+        for (action, network) in [
+            ("batch_add_rules", "2001:db8:1::/48"),
+            ("replace_rule_group", "2001:db8:2::/48"),
+        ] {
+            let response = dispatch(
+                action,
+                &json!({"group":group,"rule_type":"domain-suffix","text":format!("IP-CIDR6,{network},DIRECT")}),
+            );
+            assert_eq!(response["ok"], true, "{response}");
+            let rows = load_routing_rules(&load_conf().unwrap());
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rule_kind(&rows[0].rule_type), "ip-cidr");
+            assert_eq!(rows[0].pattern, network);
+        }
+    }
+
+    #[test]
+    fn cached_link_preview_saves_the_displayed_rules_and_preserves_config_on_expiry() {
+        let _env = TestEnv::new(SAMPLE);
+        let input = "DOMAIN,cache.example.invalid,PROXY\n".repeat(2200);
+        let preview =
+            sockrocket_core::config::rule_list::preview_rule_list(&input, "proxy", "Group")
+                .unwrap();
+        let token = rule_preview_cache::store(&preview.text).unwrap();
+        let request =
+            json!({"preview_token":token,"group_only":true,"group":"Group","target":"proxy"});
+        let first = dispatch("batch_add_rules", &request);
+        assert_eq!(first["ok"], true, "{first}");
+        let rules = act_get_rules()["rules"].as_array().unwrap().clone();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["pattern"], "cache.example.invalid");
+        let before = fs::read(conf_path()).unwrap();
+        assert_eq!(dispatch("batch_add_rules", &request)["ok"], true);
+        fs::remove_file(rule_preview_cache::root().join(token)).unwrap();
+        let expired = dispatch("batch_add_rules", &request);
+        assert_eq!(expired["preview_unavailable"], true, "{expired}");
+        assert_eq!(fs::read(conf_path()).unwrap(), before);
+        fs::remove_dir_all(rule_preview_cache::root()).unwrap();
+    }
+
+    #[test]
     fn rule_link_preview_is_read_only_and_import_stays_in_selected_group() {
         use std::io::Write;
         let _env = TestEnv::new(SAMPLE);
@@ -6230,6 +6649,15 @@ device_rule_groups:
             true
         );
         let saved = fs::read_to_string(conf_path()).unwrap();
+        for action in [act_batch_add_rules, act_replace_rule_group] {
+            let missing = action(&json!({"group":"Demo"}));
+            assert_eq!(missing["ok"], false);
+            assert!(missing["msg"].as_str().unwrap().contains("未收到"));
+            let empty = action(&json!({"group":"Demo","text":" "}));
+            assert_eq!(empty["ok"], false);
+            assert!(empty["msg"].as_str().unwrap().contains("请输入"));
+            assert_eq!(fs::read_to_string(conf_path()).unwrap(), saved);
+        }
         let invalid = "DOMAIN-SUFFIX,media.example.invalid,PROXY\nINVALID-RULE,bad,PROXY";
         for response in [
             act_batch_add_rules(&json!({"group":"Demo","text":invalid})),

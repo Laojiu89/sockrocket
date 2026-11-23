@@ -7,7 +7,7 @@ Sockrocket uses one native Rust core shared by the desktop client, CLI and Merli
 | Protocol | TCP | UDP | Notes |
 | --- | --- | --- | --- |
 | Shadowsocks | Yes | Yes | AEAD and SS2022; ShadowTLS wrapping is TCP only |
-| VMess | Yes | Yes | AEAD only (`alterId: 0`); native UDP has a per-packet size limit |
+| VMess | Yes | Yes | AEAD and legacy alter IDs; native UDP has a per-packet size limit |
 | VLESS | Yes | Yes | Raw TCP, TLS, WebSocket, XHTTP (HTTP/1.1–3) or REALITY; Vision over TLS 1.3/REALITY TCP, XUDP (standard flow excludes UDP/443) |
 | Trojan | Yes | Yes | TLS by default; REALITY over raw TCP |
 | TUIC v5 | Yes | Yes | Native QUIC datagrams, reliable QUIC streams, UDP-over-stream v1/v2 |
@@ -20,11 +20,13 @@ UDP availability also depends on the node's `udp` option. Certificate verificati
 
 ## Known outbound parameter gaps
 
+The [Merlin and Mihomo comparison](merlin-mihomo-comparison.md) covers subscription import, save and outbound construction for all nine protocols.
+
 | Protocol | Remaining limits or unverified settings |
 | --- | --- |
-| Shadowsocks | ShadowTLS v3 works with Mihomo plugin options, SIP002 share links and a sing-box Shadowsocks outbound that references a ShadowTLS transport by tag. SIP002 export preserves plugin credentials and uses percent-encoded SS2022 keys. Other SIP003 plugins and arbitrary outbound chains remain unsupported. |
-| VMess | AES-GCM and ChaCha20-Poly1305 support global padding and authenticated chunk lengths. Legacy nonzero alterId is outstanding. |
-| VLESS | Xray VLESS Encryption is outstanding. |
+| Shadowsocks | ShadowTLS v3 works with Mihomo plugin options, SIP002 share links and a sing-box Shadowsocks outbound that references a ShadowTLS transport by tag. SIP002 export preserves plugin credentials and uses percent-encoded SS2022 keys. The built-in TCP plugins also support simple-obfs (HTTP or TLS) and v2ray-plugin (WebSocket, including Mux.Cool). Arbitrary outbound chains remain unsupported. |
+| VMess | AES-GCM and ChaCha20-Poly1305 support global padding and authenticated chunk lengths. Nonzero alter IDs use legacy authentication. |
+| VLESS | The client supports the Xray `mlkem768x25519plus` encryption format. |
 | Trojan | REALITY is limited to raw TCP. sing-box UDP-only outbound policy is enforced. TLS gRPC and HTTPUpgrade carry TCP and UDP in sing-box interoperability tests. Xray TunMulti is also tested. |
 | TUIC v5 | Native, reliable QUIC-stream and UDP-over-stream v1/v2 are covered. Heartbeat timing and opt-in 0-RTT session resumption are configurable. |
 | Hysteria2 | Salamander and Gecko are tested against sing-box. Hopping changes the UDP destination port. |
