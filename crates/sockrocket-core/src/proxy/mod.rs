@@ -80,10 +80,14 @@ pub struct TunDiagnostics {
     pub packet_limit: usize,
     pub tcp_payload_bytes: usize,
     pub tcp_payload_limit: usize,
-    pub receive_bytes: usize,
+    /// TCP payload bytes waiting to be read or reassembled across live TUN flows at sampling time.
+    pub receive_buffered_bytes: usize,
     pub tcp_states: [usize; 10],
+    /// Longest time spent in the current closing state, rounded down to whole seconds.
     pub oldest_close_secs: u64,
+    /// Incoming resets from TCP peers on the TUN side.
     pub tcp_peer_resets: usize,
+    /// Subset of peer resets received in Listen or SynReceived.
     pub tcp_handshake_resets: usize,
     pub tcp_task_errors: usize,
     pub tcp_ingress_drops: usize,
@@ -143,9 +147,15 @@ impl ProxyStats {
         }
     }
     pub fn runtime_diagnostics(&self) -> serde_json::Value {
+        let tun = self.inner.tun.lock().unwrap().clone().map(|tun| {
+            let mut snapshot = serde_json::json!(tun);
+            // Existing router health consumers may still read the original key.
+            snapshot["receive_bytes"] = tun.receive_buffered_bytes.into();
+            snapshot
+        });
         serde_json::json!({"active_connections":self.active_connections(), "bytes_sent":self.bytes_sent(),
             "bytes_received":self.bytes_received(),"completed":self.inner.completed.load(Ordering::Relaxed),
-            "interrupted":self.inner.interrupted.load(Ordering::Relaxed), "tun":self.inner.tun.lock().unwrap().clone(),
+            "interrupted":self.inner.interrupted.load(Ordering::Relaxed), "tun":tun,
             "lan_reachability":"unverified"})
     }
     pub fn active_connections(&self) -> u64 {
@@ -528,6 +538,32 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ObservedIo<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tun_health_reports_buffered_bytes_under_both_keys() {
+        let stats = ProxyStats::default();
+        assert!(stats.runtime_diagnostics()["tun"].is_null());
+        stats.update_tun(TunDiagnostics {
+            sampled_at: 1,
+            running: true,
+            active: 1,
+            rejected: 0,
+            packet_bytes: 0,
+            packet_limit: 1024,
+            tcp_payload_bytes: 64,
+            tcp_payload_limit: 1024,
+            receive_buffered_bytes: 64,
+            tcp_states: [0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+            oldest_close_secs: 0,
+            tcp_peer_resets: 0,
+            tcp_handshake_resets: 0,
+            tcp_task_errors: 0,
+            tcp_ingress_drops: 0,
+        });
+        let health = stats.runtime_diagnostics();
+        assert_eq!(health["tun"]["receive_buffered_bytes"], 64);
+        assert_eq!(health["tun"]["receive_bytes"], 64);
+    }
 
     /// Concurrent record_connection calls must yield unique, dense ids, and
     /// close_connection must finalize exactly the record with that id.
