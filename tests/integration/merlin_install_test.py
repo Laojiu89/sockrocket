@@ -139,10 +139,60 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         hook_script = hook_script.replace('/jffs/addons/sockrocket/scripts/sockrocket.sh', str(control))
         assert source.count('    install_wan_hooks\n') == 2, 'both standard and koolcenter installs need WAN hooks'
         assert source.count('    install_dns_postconf_hook\n') == 2, 'both install modes need isolated 3006 DNS'
-        run('ok() { :; }\n' + hook_helper + hook_script)
-        run('ok() { :; }\n' + hook_helper + hook_script)
+        hook_env = dict(env, SOCKROCKET_DNS_POSTCONF_HOOK=str(hook_dir / 'dnsmasq.postconf'),
+                        SOCKROCKET_DNS_POSTCONF_SCRIPT=str(root / 'dnsmasq-postconf.sh'))
+        nvram = stubs / 'nvram'
+        nvram.write_text('#!/bin/sh\n[ "$2" = firmver ] && echo "$TEST_FIRMWARE"\n')
+        nvram.chmod(0o700)
+        hook_env.update(PATH=str(stubs) + os.pathsep + env['PATH'], TEST_FIRMWARE='3.0.0.6')
+        shutil.copyfile('merlin/scripts/dnsmasq-postconf.sh', hook_env['SOCKROCKET_DNS_POSTCONF_SCRIPT'])
+        subprocess.run(['sh', 'merlin/scripts/sockrocket.sh', 'install-dns-hook'],
+                       env=dict(hook_env, TEST_FIRMWARE='3.0.0.4'), check=True)
+        assert not (hook_dir / 'dnsmasq.postconf').exists()
+        hook_script = hook_script.replace('sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-dns-hook',
+                                          'sh merlin/scripts/sockrocket.sh install-dns-hook')
+        for _ in range(2):
+            subprocess.run(['sh', '-ec', 'ok() { :; }\n' + hook_helper + hook_script],
+                           env=hook_env, check=True)
         assert ': # another add-on hook' in (hook_dir / 'wan-event').read_text()
-        assert (hook_dir / 'dnsmasq.postconf').read_text().count('dnsmasq-postconf.sh "$1"') == 1
+        assert (hook_dir / 'dnsmasq.postconf').read_text().count('# >>> SOCKROCKET_AUTO_START >>>') == 1
+
+        dns_hook = hook_dir / 'dnsmasq.postconf'
+        register = ['sh', 'merlin/scripts/sockrocket.sh', 'install-dns-hook']
+        managed = dns_hook.read_text().split('\n', 1)[1]
+        other = ': # preserve this reference to sockrocket\nexit 0\n'
+        dns_hook.write_text('#!/bin/sh\n' + other + managed)
+        subprocess.run(register, env=hook_env, check=True)
+        assert dns_hook.read_text() == '#!/bin/sh\n' + managed + other
+        target = hook_dir / 'third-party-hook'
+        dns_hook.rename(target)
+        dns_hook.symlink_to(target)
+        subprocess.run(register, env=hook_env, check=True)
+        assert dns_hook.is_symlink()
+        target.write_text('#!/bin/sh\n' + other)
+        assert subprocess.run(register, env=hook_env).returncode != 0
+        assert dns_hook.is_symlink() and target.read_text() == '#!/bin/sh\n' + other
+        dns_hook.unlink()
+        malformed = '#!/bin/sh\n# >>> SOCKROCKET_AUTO_START >>>\n' + other
+        dns_hook.write_text(malformed)
+        assert subprocess.run(register, env=hook_env).returncode != 0
+        assert dns_hook.read_text() == malformed
+
+        uninstall = Path('merlin/uninstall.sh').read_text()
+        dns_cleanup = uninstall[uninstall.index('dns_hook=/jffs/scripts/dnsmasq.postconf'):
+                                uninstall.index('ok "Hooks cleaned"')].replace('/jffs/scripts/dnsmasq.postconf', str(dns_hook))
+        # BusyBox and GNU sed accept -i without an argument; BSD sed needs an empty suffix.
+        if sys.platform == 'darwin':
+            dns_cleanup = dns_cleanup.replace("sed -i ", "sed -i '' ")
+        run(dns_cleanup)
+        assert dns_hook.read_text() == malformed
+        dns_hook.write_text('#!/bin/sh\n' + managed + other)
+        run(dns_cleanup)
+        assert dns_hook.read_text() == '#!/bin/sh\n' + other
+        dns_hook.unlink()
+        dns_hook.symlink_to(target)
+        run(dns_cleanup)
+        assert dns_hook.is_symlink() and target.read_text() == '#!/bin/sh\n' + other
 
         def event(name, *args):
             subprocess.run(['sh', str(hook_dir / name), *args], env=env, check=True)

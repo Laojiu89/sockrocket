@@ -119,7 +119,16 @@ remove_hook /jffs/scripts/wan-start
 remove_hook /jffs/scripts/wan-event
 remove_hook /jffs/scripts/dhcpc-event
 remove_hook /jffs/scripts/nat-start
-remove_hook /jffs/scripts/dnsmasq.postconf
+# DNS registration owns only the marked block. Keep firmware symlinks
+# and other add-ons' lines (including references to Sockrocket) intact.
+dns_hook=/jffs/scripts/dnsmasq.postconf
+if [ -f "$dns_hook" ] && [ ! -L "$dns_hook" ] && awk '
+    /^# >>> SOCKROCKET_AUTO_START >>>$/ { if (inside) exit 1; inside=1; found=1 }
+    /^# <<< SOCKROCKET_AUTO_END <<<$/ { if (!inside) exit 1; inside=0 }
+    END { if (inside || !found) exit 1 }
+' "$dns_hook"; then
+    sed -i '/^# >>> SOCKROCKET_AUTO_START >>>$/,/^# <<< SOCKROCKET_AUTO_END <<<$/d' "$dns_hook"
+fi
 ok "Hooks cleaned"
 
 # ── dnsmasq / DNS pin ─────────────────────────────────────────────────────────
