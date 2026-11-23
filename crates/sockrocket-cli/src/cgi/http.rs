@@ -127,8 +127,10 @@ fn rpc_result_janitor() -> RpcResultJanitor {
 }
 
 /// Read one HTTP request. Returns None on malformed/oversized input or EOF.
-/// Caps: 16 KB headers, 1 MB body — plenty for save_config payloads.
-pub(super) async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<ApiRequest> {
+/// Headers are capped at 16 KiB. The body limit is shared with the CGI action.
+pub(super) async fn read_request(
+    sock: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Option<ApiRequest> {
     use tokio::io::AsyncReadExt;
 
     let mut buf: Vec<u8> = Vec::with_capacity(2048);
@@ -206,7 +208,7 @@ pub(super) async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Api
         }
     }
     let content_len = content_len.unwrap_or(0);
-    if content_len > 1024 * 1024 {
+    if content_len as u64 > super::request_body_limit(&action) {
         return None;
     }
 

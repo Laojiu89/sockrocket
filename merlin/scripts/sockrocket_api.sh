@@ -45,13 +45,24 @@ for pending in "$RUNTIME_DIR"/rule-body-*; do
     modified=$(date -r "$pending" +%s 2>/dev/null) || continue
     [ "$(( $(date +%s) - modified ))" -le 120 ] || rm -f "$pending"
 done
+# Maximum Base64 length for each action's decoded JSON request.
+transfer_limit() {
+    case "$1" in
+        save_config) echo 11184812 ;;
+        batch_add_rules|replace_rule_group) echo 5592408 ;;
+        *) echo 1398104 ;;
+    esac
+}
 if [ "$ACTION" = rpc_rule_part ]; then
     reject_part() { respond 0; exit 1; }
     offset=$4
     case "$offset" in ''|*[!0-9]*) reject_part ;; esac
-    [ "${#SEQ}" = 32 ] && [ "${#offset}" -le 7 ] && [ "$offset" -lt 1398104 ] || reject_part
+    # Older pages omit the action. Allow a rule-sized upload, then enforce
+    # the final action's limit independently before dispatch.
+    part_limit=$(transfer_limit "${5:-batch_add_rules}")
+    [ "${#SEQ}" = 32 ] && [ "${#offset}" -le 8 ] && [ "$offset" -lt "$part_limit" ] || reject_part
     [ "$ENCODING" = base64 ] && [ -n "$ARGS" ] && [ "${#ARGS}" -le 2048 ] || reject_part
-    [ "$offset" -le "$((1398104 - ${#ARGS}))" ] || reject_part
+    [ "$offset" -le "$((part_limit - ${#ARGS}))" ] || reject_part
     if [ "$offset" = 0 ]; then
         (set -C; : > "$BODY") || reject_part
     fi
@@ -73,7 +84,7 @@ SLOT=""
 missing_body=false
 [ -n "$ARGS" ] || { missing_body=true; ARGS="{}"; }
 staged=""
-if { [ "$ACTION" = batch_add_rules ] || [ "$ACTION" = save_config ]; } && [ -n "$4" ]; then
+if [ -n "$4" ]; then
     # Only one final request can claim the complete body for this nonce.
     staged="$RUNTIME_DIR/rule-body-$SEQ.claimed.$$"
     mv "$BODY" "$staged" 2>/dev/null || :
@@ -106,15 +117,20 @@ request_body() {
     if [ -n "$staged" ]; then cat "$staged"; else printf '%s' "$ARGS"; fi
 }
 valid_staged_body() {
+    limit=$(transfer_limit "$ACTION")
     case "$4" in ''|*[!0-9]*) return 1 ;; esac
-    [ "${#4}" -le 7 ] && [ "$4" -gt 0 ] && [ "$4" -le 1398104 ] &&
+    [ "${#4}" -le 8 ] && [ "$4" -gt 0 ] && [ "$4" -le "$limit" ] &&
         [ -f "$staged" ] && [ "$(wc -c < "$staged")" -eq "$4" ]
 }
 if [ -n "$staged" ]; then ENCODING=base64; fi
+case "$ACTION" in
+    add_rule|batch_add_rules|replace_rule_group|set_rule_group_enabled|delete_rule_group|add_node|save_config) requires_body=true ;;
+    *) requires_body=false ;;
+esac
 if [ -n "$staged" ] && ! valid_staged_body "$@"; then
-    printf '{"ok":false,"msg":"导入内容未完整传送，请保留草稿并重试。"}' > "$TEMP"
-elif [ "$ACTION" = batch_add_rules ] && [ -z "$staged" ] && [ "$missing_body" = true ]; then
-    printf '{"ok":false,"msg":"规则内容未传到路由器，请刷新插件页面后重新导入。"}' > "$TEMP"
+    printf '{"ok":false,"msg":"提交内容未完整传到路由器，请保留草稿并重试。"}' > "$TEMP"
+elif [ "$requires_body" = true ] && [ -z "$staged" ] && [ "$missing_body" = true ]; then
+    printf '{"ok":false,"msg":"路由器未收到提交内容，请保留草稿并重试。"}' > "$TEMP"
 elif [ -z "$SLOT" ]; then
     printf '{"error":"Router busy; retry shortly","error_code":"busy"}' > "$TEMP"
 elif [ ! -x "$SOCKROCKET_BIN" ]; then

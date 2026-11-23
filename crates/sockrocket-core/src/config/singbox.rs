@@ -74,7 +74,8 @@ struct SingBoxOutbound {
     // Transport
     transport: Option<SingBoxTransport>,
 
-    network: Option<String>,
+    #[serde(default, deserialize_with = "string_list")]
+    network: Vec<String>,
 
     // UDP
     #[serde(default)]
@@ -92,7 +93,8 @@ struct SingBoxTls {
     #[serde(default)]
     insecure: bool,
     server_name: Option<String>,
-    alpn: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "string_list")]
+    alpn: Vec<String>,
     #[serde(default)]
     disable_sni: bool,
     utls: Option<SingBoxUtls>,
@@ -113,6 +115,21 @@ struct SingBoxReality {
 struct SingBoxUtls {
     enabled: Option<bool>,
     fingerprint: Option<String>,
+}
+
+// sing-box Listable fields accept either a single item or an array.
+fn string_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum List {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match Option::<List>::deserialize(d)? {
+        None => vec![],
+        Some(List::One(value)) => vec![value],
+        Some(List::Many(values)) => values,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,12 +307,22 @@ fn convert_singbox_outbound(
         });
     }
 
-    let udp = match ob.network.as_deref() {
-        None | Some("") => ob.udp.unwrap_or(true),
-        Some("tcp") => false,
-        Some("udp") if ob.outbound_type == "trojan" && ob.udp != Some(false) => true,
-        Some(_) => anyhow::bail!("Unsupported outbound network restriction"),
-    };
+    anyhow::ensure!(
+        ob.network
+            .iter()
+            .all(|network| matches!(network.as_str(), "" | "tcp" | "udp")),
+        "Unsupported outbound network restriction"
+    );
+    let allow_tcp = ob.network.iter().any(|network| network == "tcp");
+    let allow_udp = ob.network.iter().any(|network| network == "udp");
+    let udp_only = allow_udp && !allow_tcp;
+    anyhow::ensure!(
+        !udp_only
+            || (matches!(ob.outbound_type.as_str(), "trojan" | "hysteria2" | "hy2")
+                && ob.udp != Some(false)),
+        "Unsupported UDP-only outbound"
+    );
+    let udp = (!allow_tcp || allow_udp) && ob.udp.unwrap_or(true);
 
     let protocol = match ob.outbound_type.as_str() {
         "anytls" => ProxyProtocol::AnyTls {
@@ -344,9 +371,15 @@ fn convert_singbox_outbound(
             let password = ob
                 .password
                 .as_ref()
+                .filter(|password| !password.is_empty())
                 .context("Hysteria2 missing password")?
                 .clone();
-            let obfs: Option<Hy2Obfs> = ob.obfs.clone().map(serde_json::from_value).transpose()?;
+            let obfs: Option<Hy2Obfs> = ob
+                .obfs
+                .as_ref()
+                .filter(|v| !v.as_object().is_some_and(|fields| fields.is_empty()))
+                .map(Hy2Obfs::deserialize)
+                .transpose()?;
             if let Some(o) = &obfs {
                 o.validate()?;
             }
@@ -434,14 +467,16 @@ fn convert_singbox_outbound(
     if ob.outbound_type == "tuic" && ob.zero_rtt_handshake {
         extra.insert(super::v2ray::TUIC_ZERO_RTT.into(), "true".into());
     }
-    if ob.network.as_deref() == Some("udp") {
+    if udp_only {
         extra.insert(super::v2ray::UDP_ONLY.into(), "true".into());
     }
     if ob.outbound_type == "vmess" {
         super::v2ray::vmess_framing_options(&mut extra, ob.global_padding, ob.authenticated_length);
     }
     if matches!(protocol, ProxyProtocol::Hysteria2 { .. }) {
-        if let Some(list) = &ob.server_ports {
+        if let Some(list) = &ob.server_ports
+            && !list.as_array().is_some_and(Vec::is_empty)
+        {
             let items = match list {
                 serde_json::Value::Array(a) => a.as_slice(),
                 v => std::slice::from_ref(v),
@@ -455,20 +490,26 @@ fn convert_singbox_outbound(
                 })
                 .collect::<Result<Vec<_>>>()?
                 .join(",");
-            port = ports
-                .split(['-', ','])
-                .next()
-                .context("Missing Hysteria2 port")?
-                .parse()?;
-            super::v2ray::validate_hysteria2_mport(&ports, port)?;
+            port = super::v2ray::hysteria2_initial_port(&ports, 0)?;
             extra.insert(super::v2ray::HY2_MPORT.into(), ports);
         }
+        anyhow::ensure!(
+            !server.trim().is_empty() && port != 0,
+            "Missing Hysteria2 server or port"
+        );
+        anyhow::ensure!(
+            ob.transport.is_none(),
+            "Unsupported external Hysteria2 transport"
+        );
         for (value, field) in [
             (&ob.hop_interval, super::v2ray::HY2_HOP_INTERVAL),
             (&ob.hop_interval_max, super::v2ray::HY2_HOP_MAX),
         ] {
-            if let Some(v) = value {
-                extra.insert(field.into(), duration_millis(v)?.to_string());
+            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                let ms = duration_millis(v)?;
+                if ms != 0 {
+                    extra.insert(field.into(), ms.to_string());
+                }
             }
         }
         for (rate, key) in [
@@ -491,7 +532,7 @@ fn convert_singbox_outbound(
         decode_display_name(&ob.tag)
     };
 
-    Ok(Some(Node {
+    let node = Node {
         name,
         server,
         port,
@@ -500,7 +541,11 @@ fn convert_singbox_outbound(
         latency_ms: None,
         tags: vec![],
         extra,
-    }))
+    };
+    if matches!(node.protocol, ProxyProtocol::Hysteria2 { .. }) {
+        crate::create_outbound_unwarmed(&node)?;
+    }
+    Ok(Some(node))
 }
 
 fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfig>> {
@@ -583,9 +628,13 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
 
     let tls = if has_tls {
         Some(TlsConfig {
-            sni: tls_cfg.and_then(|t| t.server_name.clone()),
+            sni: tls_cfg
+                .and_then(|t| t.server_name.clone())
+                .filter(|s| !s.is_empty()),
             skip_cert_verify: tls_cfg.map(|t| t.insecure).unwrap_or(false),
-            alpn: tls_cfg.and_then(|t| t.alpn.clone()),
+            alpn: tls_cfg
+                .filter(|t| !t.alpn.is_empty())
+                .map(|t| t.alpn.clone()),
             fingerprint: tls_cfg.and_then(|t| {
                 t.utls
                     .as_ref()
@@ -858,6 +907,74 @@ mod tests {
         }"#;
         let nodes = parse_singbox_config(json).unwrap();
         assert_eq!(nodes.len(), 0);
+    }
+
+    #[test]
+    fn singbox_hy2_bulk_preserves_wire_options_and_skips_unusable_entries() {
+        use super::super::v2ray::{HY2_HOP_INTERVAL, HY2_HOP_MAX, HY2_MPORT, UDP_ONLY};
+        use serde_json::json;
+        let valid = json!({
+            "type":"hysteria2","tag":"hopping","server":"vpn.example.invalid","server_port":443,
+            "server_ports":["41000:41003","42001:42003"],"hop_interval":"4.5s","hop_interval_max":"9s",
+            "password":"user:p@ss:","network":"udp","tls":{"enabled":true,"alpn":"h3","server_name":"tls.example.invalid"},
+            "obfs":{"type":"gecko","password":"fixture","min_packet_size":512,"max_packet_size":1100}
+        });
+        let mut defaults = valid.clone();
+        defaults["network"] = json!(["tcp", "udp"]);
+        defaults["server_ports"] = json!([]);
+        defaults["hop_interval"] = json!("0s");
+        defaults["hop_interval_max"] = json!("");
+        defaults["tls"] = json!({"enabled":true,"alpn":[],"server_name":""});
+        defaults["obfs"] = json!({});
+        let mut broken = valid.clone();
+        broken["hop_interval_max"] = json!("1s");
+        let mut unauthenticated = valid.clone();
+        unauthenticated["password"] = json!("");
+        let batch = json!({"outbounds":[valid,broken,defaults,unauthenticated]});
+        let nodes = crate::parse_singbox_config(&batch.to_string()).unwrap();
+        assert_eq!(nodes.len(), 2);
+        let stored: Node =
+            serde_yaml::from_str(&serde_yaml::to_string(&nodes[0]).unwrap()).unwrap();
+        let ProxyProtocol::Hysteria2 {
+            password,
+            obfs: Some(obfs),
+            udp: true,
+        } = &stored.protocol
+        else {
+            panic!("expected UDP with Gecko")
+        };
+        assert_eq!(password, "user:p@ss:");
+        assert_eq!(
+            (
+                obfs.kind.as_str(),
+                obfs.password.as_str(),
+                obfs.max_packet_size
+            ),
+            ("gecko", "fixture", Some(1100))
+        );
+        assert_eq!(stored.port, 41000);
+        assert_eq!(stored.extra[HY2_MPORT], "41000-41003,42001-42003");
+        assert_eq!(stored.extra[HY2_HOP_INTERVAL], "4500");
+        assert_eq!(stored.extra[HY2_HOP_MAX], "9000");
+        assert_eq!(stored.extra[UDP_ONLY], "true");
+        let tls = stored.transport.as_ref().unwrap().tls.as_ref().unwrap();
+        assert_eq!(tls.sni.as_deref(), Some("tls.example.invalid"));
+        assert_eq!(tls.alpn.as_ref().unwrap(), &["h3"]);
+        assert!(crate::create_outbound_unwarmed(&stored).is_ok());
+        assert_eq!(nodes[1].port, 443);
+        assert!(nodes[1].protocol.supports_udp());
+        assert!(!nodes[1].extra.contains_key(UDP_ONLY));
+        assert!(
+            nodes[1]
+                .transport
+                .as_ref()
+                .unwrap()
+                .tls
+                .as_ref()
+                .unwrap()
+                .sni
+                .is_none()
+        );
     }
 
     #[test]

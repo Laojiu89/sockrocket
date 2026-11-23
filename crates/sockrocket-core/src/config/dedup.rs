@@ -98,6 +98,39 @@ fn detach_sources(nodes: &mut Vec<Node>, removed: &HashSet<String>) {
     });
 }
 
+/// A partial download cannot tell us which unmatched rows the provider removed.
+/// A unique provider remark can still identify a rotated credential or endpoint.
+pub(super) fn retain_unmatched_nodes(saved: &[Node], url: &str, incoming: &mut Vec<Node>) {
+    let old: Vec<_> = saved
+        .iter()
+        .filter_map(|node| {
+            subscription_names(node)
+                .remove(url)
+                .map(|name| (node, name))
+        })
+        .collect();
+    let mut new_names = HashMap::new();
+    let mut old_names = HashMap::new();
+    let mut fresh = HashSet::new();
+    for node in incoming.iter() {
+        *new_names.entry(node.name.clone()).or_insert(0usize) += 1;
+        fresh.insert((node.name.clone(), node_fingerprint(node)));
+    }
+    for (_, name) in &old {
+        *old_names.entry(name.clone()).or_insert(0usize) += 1;
+    }
+    for (node, name) in old {
+        if (old_names.get(&name) == Some(&1) && new_names.get(&name) == Some(&1))
+            || fresh.contains(&(name.clone(), node_fingerprint(node)))
+        {
+            continue;
+        }
+        let mut retained = node.clone();
+        retained.name = name;
+        incoming.push(retained);
+    }
+}
+
 /// Replace nodes belonging to subscriptions that just refreshed.
 ///
 /// Fresh nodes win fingerprint ties, so an updated password replaces the

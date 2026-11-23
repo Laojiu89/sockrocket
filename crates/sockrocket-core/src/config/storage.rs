@@ -115,11 +115,26 @@ impl MutationGuard {
 pub struct SubscriptionRefreshSnapshot {
     pub url: String,
     pub revision: String,
+    pub skipped_entries: usize,
+}
+
+impl SubscriptionRefreshSnapshot {
+    pub fn retain_unparsed_nodes(
+        &self,
+        saved: &[super::model::Node],
+        incoming: &mut Vec<super::model::Node>,
+    ) {
+        if self.skipped_entries > 0 {
+            super::dedup::retain_unmatched_nodes(saved, &self.url, incoming);
+        }
+    }
 }
 
 pub struct SubscriptionRefreshCommit {
     pub config: super::model::AppConfig,
     pub applied_urls: Vec<String>,
+    pub skipped_entries: usize,
+    pub retained_entries: usize,
 }
 
 pub fn new_subscription_revision() -> String {
@@ -135,7 +150,7 @@ pub fn commit_subscription_refresh(
 ) -> Result<SubscriptionRefreshCommit> {
     let _guard = MutationGuard::acquire(path)?;
     let mut current = super::model::AppConfig::from_yaml_str(&fs::read_to_string(path)?)?;
-    let applicable: Vec<_> = refreshed
+    let mut applicable: Vec<_> = refreshed
         .into_iter()
         .filter(|(snapshot, nodes)| {
             !nodes.is_empty()
@@ -144,6 +159,14 @@ pub fn commit_subscription_refresh(
                 })
         })
         .collect();
+    let mut skipped_entries = 0;
+    let mut retained_entries = 0;
+    for (source, nodes) in &mut applicable {
+        let incoming = nodes.len();
+        source.retain_unparsed_nodes(&current.nodes, nodes);
+        skipped_entries += source.skipped_entries;
+        retained_entries += nodes.len() - incoming;
+    }
     let mut applied_urls: Vec<_> = applicable
         .iter()
         .map(|(snapshot, _)| snapshot.url.clone())
@@ -162,6 +185,8 @@ pub fn commit_subscription_refresh(
     Ok(SubscriptionRefreshCommit {
         config: current,
         applied_urls,
+        skipped_entries,
+        retained_entries,
     })
 }
 
@@ -436,6 +461,7 @@ mod tests {
         let source = SubscriptionRefreshSnapshot {
             url: url.into(),
             revision: first_revision.clone(),
+            skipped_entries: 0,
         };
         let mut first = node_for_persist();
         first.server = "newer.invalid".into();
@@ -537,6 +563,7 @@ mod tests {
                     SubscriptionRefreshSnapshot {
                         url: url.into(),
                         revision,
+                        skipped_entries: 0,
                     },
                     vec![fresh],
                 )],
@@ -558,6 +585,66 @@ mod tests {
                 Some("retained")
             );
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_refresh_keeps_unmatched_nodes_until_a_complete_download() {
+        use crate::config::dedup::tag_subscription_nodes;
+        use crate::config::model::{AppConfig, Subscription};
+        let dir =
+            std::env::temp_dir().join(format!("sockrocket-refresh-mixed-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let url = "https://sub.invalid/hy2";
+        let node = |port, name| {
+            crate::parse_hysteria2_uri(&format!("hy2://secret@hy2.invalid:{port}#{name}")).unwrap()
+        };
+        let mut saved = vec![
+            node(1000, "Rotate"),
+            node(2000, "Lost"),
+            node(3000, "Shared"),
+            node(3001, "Shared"),
+        ];
+        tag_subscription_nodes(&mut saved, url);
+        let mut config = AppConfig::default();
+        config.subscriptions.push(Subscription {
+            name: "Test".into(),
+            url: url.into(),
+            format: "auto".into(),
+            last_updated: None,
+            refresh_interval_hours: 24,
+            refresh_revision: String::new(),
+        });
+        config.nodes = saved;
+        config.active_node = Some(1);
+        fs::write(&path, serde_yaml::to_string(&config).unwrap()).unwrap();
+        let snapshot = |revision, skipped_entries| SubscriptionRefreshSnapshot {
+            url: url.into(),
+            revision,
+            skipped_entries,
+        };
+        let fresh = vec![node(1001, "Rotate"), node(3001, "Shared")];
+        let partial =
+            commit_subscription_refresh(&path, vec![(snapshot(String::new(), 2), fresh.clone())])
+                .unwrap();
+        let ports = |c: &AppConfig| c.nodes.iter().map(|n| n.port).collect::<Vec<_>>();
+        assert_eq!(ports(&partial.config), [1001, 3001, 2000, 3000]);
+        assert_eq!(
+            partial.config.nodes[partial.config.active_node.unwrap()].port,
+            2000
+        );
+        assert_eq!((partial.skipped_entries, partial.retained_entries), (2, 2));
+        let revision = partial.config.subscriptions[0].refresh_revision.clone();
+        let again =
+            commit_subscription_refresh(&path, vec![(snapshot(revision, 2), fresh.clone())])
+                .unwrap();
+        assert_eq!(ports(&again.config), ports(&partial.config));
+        let revision = again.config.subscriptions[0].refresh_revision.clone();
+        let complete =
+            commit_subscription_refresh(&path, vec![(snapshot(revision, 0), fresh)]).unwrap();
+        assert_eq!(ports(&complete.config), [1001, 3001]);
+        assert_eq!(complete.retained_entries, 0);
         fs::remove_dir_all(dir).unwrap();
     }
 

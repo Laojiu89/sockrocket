@@ -35,7 +35,7 @@ assert.equal(element('rule-preset-panel').hidden,true);
 assert.equal(element('rule-list-panel').hidden,false);
 assert.equal(element('rule-preset-add').disabled,true);assert.equal(element('rule-preset-enable').hidden,false);assert.equal(element('rule-preset-disable').hidden,true);
 c.toggleRulePreset(true);let enable=request('set_rule_group_enabled');
-assert.equal(enable[1].group,presets[0].group);assert.equal(enable[1].enabled,true);assert.equal(enable[1].expected_rules.length,2);assert.equal(enable[1].expected_rules[0].enabled,false);
+assert.equal(enable[1].group,presets[0].group);assert.equal(enable[1].enabled,true);assert.equal(enable[1].revision,'added');assert.equal(enable[1].expected_rules,undefined);
 enable[2]({ok:true});refresh(rows.map(r=>({...r,enabled:true})),'enabled');
 assert.equal(element('rule-preset-enable').hidden,true);assert.equal(element('rule-preset-disable').hidden,false);
 c.toggleRulePreset(false);let disable=request('set_rule_group_enabled');assert.equal(disable[1].enabled,false);

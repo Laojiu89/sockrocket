@@ -1,0 +1,14 @@
+# Synthetic endpoints and credentials for offline configuration checks.
+mode: rule
+proxies:
+  - {name: fixture-ss, type: ss, server: ss.example.invalid, port: 8388, cipher: aes-128-gcm, password: fixture}
+  - {name: fixture-vmess, type: vmess, server: vmess.example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000001', alterId: 0, cipher: auto, tls: true, network: ws, ws-opts: {path: /test}}
+  - {name: fixture-vless, type: vless, server: vless.example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000002', tls: true, servername: cert.example.invalid}
+  - {name: fixture-trojan, type: trojan, server: trojan.example.invalid, port: 443, password: fixture, sni: cert.example.invalid}
+  - {name: fixture-hy2, type: hysteria2, server: hy2.example.invalid, port: 443, ports: '443,8443-8445', password: fixture, sni: cert.example.invalid, obfs: salamander, obfs-password: fixture-padding}
+  - {name: fixture-tuic, type: tuic, server: tuic.example.invalid, port: 443, uuid: '00000000-0000-4000-8000-000000000003', password: fixture, alpn: [h3], sni: cert.example.invalid}
+  - {name: fixture-anytls, type: anytls, server: anytls.example.invalid, port: 443, password: fixture, sni: cert.example.invalid}
+  - {name: fixture-mieru, type: mieru, server: mieru.example.invalid, port: 2027, transport: TCP, username: fixture, password: fixture}
+  - {name: fixture-wireguard, type: wireguard, server: wg.example.invalid, port: 51820, ip: 192.0.2.10, private-key: 'CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws=', public-key: 'DAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw=', udp: true}
+rules:
+  - MATCH,DIRECT

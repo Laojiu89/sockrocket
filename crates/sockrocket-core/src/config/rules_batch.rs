@@ -228,6 +228,9 @@ pub fn merge_rules(
     conflict: BatchConflict,
     within_group: bool,
 ) -> BatchMergeStats {
+    if matches!(conflict, BatchConflict::Skip) {
+        return insert_new_rules(existing, incoming, within_group);
+    }
     let mut stats = BatchMergeStats::default();
     // Insert newest-first among the batch so the first pasted line stays highest.
     for rule in incoming.into_iter().rev() {
@@ -237,21 +240,16 @@ pub fn merge_rules(
                 && e.pattern == rule.pattern
                 && e.source == rule.source
         }) {
-            match conflict {
-                BatchConflict::Skip => stats.skipped += 1,
-                BatchConflict::Replace => {
-                    existing[pos].target = rule.target;
-                    existing[pos].enabled = rule.enabled;
-                    existing[pos].priority = rule.priority;
-                    if !rule.name.is_empty() {
-                        existing[pos].name = rule.name;
-                    }
-                    if !rule.group.is_empty() {
-                        existing[pos].group = rule.group;
-                    }
-                    stats.replaced += 1;
-                }
+            existing[pos].target = rule.target;
+            existing[pos].enabled = rule.enabled;
+            existing[pos].priority = rule.priority;
+            if !rule.name.is_empty() {
+                existing[pos].name = rule.name;
             }
+            if !rule.group.is_empty() {
+                existing[pos].group = rule.group;
+            }
+            stats.replaced += 1;
             continue;
         }
         let insert_at = existing
@@ -262,6 +260,59 @@ pub fn merge_rules(
         stats.added += 1;
     }
     stats
+}
+
+/// A large imported list commonly has one priority and thousands of new IPs.
+/// Index duplicate keys before moving the rules, then merge in a single pass.
+fn insert_new_rules(
+    existing: &mut Vec<RoutingRule>,
+    incoming: Vec<RoutingRule>,
+    within_group: bool,
+) -> BatchMergeStats {
+    fn key(rule: &RoutingRule, within_group: bool) -> (&str, &str, &str, &str) {
+        (
+            if within_group { rule.group.trim() } else { "" },
+            &rule.rule_type,
+            &rule.pattern,
+            &rule.source,
+        )
+    }
+    let mut keep = vec![false; incoming.len()];
+    {
+        let mut seen: std::collections::HashSet<_> = existing
+            .iter()
+            .map(|rule| key(rule, within_group))
+            .collect();
+        // As before, the last occurrence in the pasted list wins on duplicates.
+        for (index, rule) in incoming.iter().enumerate().rev() {
+            keep[index] = seen.insert(key(rule, within_group));
+        }
+    }
+    let total = incoming.len();
+    let mut new: Vec<_> = incoming
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(rule, keep)| keep.then_some(rule))
+        .collect();
+    let added = new.len();
+    if added > 0 {
+        new.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
+        let mut new = new.into_iter().peekable();
+        let mut result = Vec::with_capacity(existing.len() + added);
+        for old in existing.drain(..) {
+            while new.peek().is_some_and(|rule| rule.priority >= old.priority) {
+                result.push(new.next().unwrap());
+            }
+            result.push(old);
+        }
+        result.extend(new);
+        *existing = result;
+    }
+    BatchMergeStats {
+        added,
+        skipped: total - added,
+        replaced: 0,
+    }
 }
 
 fn parse_one_line(line: &str, default_target: &str) -> Result<RoutingRule, String> {
@@ -624,6 +675,41 @@ mod tests {
         assert_eq!(named.rules[0].target, "proxy");
         assert_eq!(named.rules[1].target, "group:Video");
         assert_eq!(named.rules[2].target, "direct");
+    }
+
+    #[test]
+    fn large_import_merge_preserves_priority_order_and_group_identity() {
+        let mut existing = parse_batch_rules("old.test\nkept.test\nglobal.test", "proxy").rules;
+        existing[0].priority = 20;
+        // Existing configurations can contain manually reordered priorities.
+        existing[2].priority = 10;
+        let mut incoming = parse_batch_rules_in_group(
+            "first.test\nexisting.test\nold.test\nlast.test\nexisting.test",
+            "direct",
+            "Imported",
+        )
+        .rules;
+        incoming[0].priority = 20;
+        incoming[1].target = "reject".into();
+        incoming[2].priority = 5;
+        let result = merge_rules(&mut existing, incoming, BatchConflict::Skip, true);
+        assert_eq!((result.added, result.skipped), (4, 1));
+        assert_eq!(
+            existing
+                .iter()
+                .map(|r| r.pattern.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "first.test",
+                "old.test",
+                "old.test",
+                "last.test",
+                "existing.test",
+                "kept.test",
+                "global.test"
+            ]
+        );
+        assert_eq!(existing[4].target, "direct");
     }
 
     #[test]

@@ -499,32 +499,58 @@ fn subscription_addresses(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> 
 }
 
 fn subscription_entry_count(content: &str) -> usize {
-    let count = |text: &str| {
-        text.lines()
-            .filter(|line| {
-                let line = line.trim();
-                !line.starts_with('#') && line.contains("://")
-            })
-            .count()
-    };
-    let clash_count = |text: &str| {
-        super::storage::parse_yaml_document(text)
-            .ok()
-            .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
-            .unwrap_or(0)
-    };
-    let content = content.trim_start_matches('\u{feff}').trim();
-    match detect_format(content) {
-        SubFormat::PlainLines => count(content),
-        SubFormat::Clash => clash_count(content),
-        SubFormat::Base64Lines => {
-            decode_subscription_text(content).map_or(0, |text| match detect_format(&text) {
-                SubFormat::PlainLines => count(&text),
-                SubFormat::Clash => clash_count(&text),
-                _ => 0,
-            })
+    fn count(text: &str) -> usize {
+        let text = text.trim_start_matches('\u{feff}').trim();
+        if text.starts_with("[Interface]") {
+            return 1;
         }
-        _ => 0,
+        match detect_format(text) {
+            SubFormat::Clash => super::storage::parse_yaml_document(text)
+                .ok()
+                .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
+                .unwrap_or(0),
+            SubFormat::SingBox | SubFormat::V2Ray => {
+                let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+                    return 0;
+                };
+                ["outbounds", "endpoints"]
+                    .into_iter()
+                    .filter_map(|key| root[key].as_array())
+                    .flatten()
+                    .filter(|entry| {
+                        // Built-in routes and ShadowTLS wrappers are not standalone nodes.
+                        !matches!(
+                            entry
+                                .get("type")
+                                .or_else(|| entry.get("protocol"))
+                                .and_then(|v| v.as_str()),
+                            Some(
+                                "direct"
+                                    | "block"
+                                    | "dns"
+                                    | "selector"
+                                    | "urltest"
+                                    | "shadowtls"
+                                    | "freedom"
+                                    | "blackhole"
+                                    | "loopback"
+                            )
+                        )
+                    })
+                    .count()
+            }
+            _ => text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .count(),
+        }
+    }
+    let content = content.trim_start_matches('\u{feff}').trim();
+    if looks_like_base64(content) {
+        decode_subscription_text(content).map_or(0, |text| count(&text))
+    } else {
+        count(content)
     }
 }
 
@@ -1000,6 +1026,17 @@ mod tests {
         assert_eq!(subscription_entry_count(lines), 2);
         assert_eq!(
             subscription_entry_count(&general_purpose::STANDARD.encode(lines)),
+            2
+        );
+        let singbox = r#"{"outbounds":[{"type":"hysteria2","server":"hy2.invalid","server_port":443,"password":"fixture","tls":{"enabled":true}},
+            {"type":"hysteria2","server":"hy2.invalid","server_port":444,"tls":{"enabled":true}},{"type":"selector"},{"type":"direct"}]}"#;
+        assert_eq!(
+            parse_subscription_content(singbox, "auto").unwrap().len(),
+            1
+        );
+        assert_eq!(subscription_entry_count(singbox), 2);
+        assert_eq!(
+            subscription_entry_count(&general_purpose::STANDARD.encode(singbox)),
             2
         );
         let clash = "proxies:\n  - {name: good, type: ss, server: good.invalid, port: 8388, cipher: aes-128-gcm, password: synthetic}\n  - {name: bad, type: unsupported, server: bad.invalid, port: 443}\n";
