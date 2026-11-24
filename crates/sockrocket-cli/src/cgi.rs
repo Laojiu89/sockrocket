@@ -2620,6 +2620,7 @@ const RULE_TYPES: &[&str] = &[
     "domain",
     "domain-suffix",
     "domain-keyword",
+    "domain-set",
     "ip-cidr",
     "geoip",
     "dst-port",
@@ -2647,6 +2648,9 @@ fn valid_rule_pattern(rule_type: &str, pattern: &str) -> std::result::Result<Str
             } else {
                 Err("Invalid domain suffix format (e.g. example.com)".into())
             }
+        }
+        "domain-set" => {
+            sockrocket_core::make_typed_rule(rule_type, p, "proxy", "").map(|r| r.pattern)
         }
         "domain-keyword" => {
             if !p.is_empty() && !p.chars().any(char::is_whitespace) {
@@ -3182,7 +3186,7 @@ fn act_fetch_rule_list(post: &J) -> J {
             } else {
                 None
             };
-            json!({"ok":true,"text":preview.text,"count":preview.count,"skipped":preview.skipped,"preview_token":token})
+            json!({"ok":true,"text":preview.text,"count":preview.count,"packed_domains":preview.packed_domains,"skipped":preview.skipped,"preview_token":token})
         }
         Err(error) => err_msg(format!("{error:#}")),
     }
@@ -3205,6 +3209,7 @@ fn parse_pasted_rules(
                 "SOURCE"
                     | "DOMAIN"
                     | "DOMAIN-SUFFIX"
+                    | "DOMAIN-SET"
                     | "DOMAIN-KEYWORD"
                     | "IP-CIDR"
                     | "IP-CIDR6"
@@ -6640,6 +6645,56 @@ device_rule_groups:
             assert_eq!(rule_kind(&rows[0].rule_type), "ip-cidr");
             assert_eq!(rows[0].pattern, network);
         }
+    }
+
+    #[test]
+    fn cn_mrs_and_legacy_rules_survive_append_reload_and_reimport() {
+        use sockrocket_core::config::rule_list::preview_rule_list_bytes;
+        use sockrocket_core::router::{RouteAction, Router, RuleSet};
+        // MetaCubeX/meta-rules-dat geo/geosite/cn.mrs, blob f57532f0fdfbb0aa4fee71c9c18b253c06bc12ef.
+        let cn = include_bytes!("../../sockrocket-core/tests/fixtures/mrs/cn.mrs");
+        let _env = TestEnv::new(SAMPLE);
+        let legacy = preview_rule_list_bytes(
+            b"# old list\nDOMAIN,legacy.example,REJECT\nIP-CIDR,192.0.2.0/24,DIRECT",
+            "proxy",
+            "Old",
+        )
+        .unwrap();
+        assert_eq!(legacy.count, 2);
+        assert_eq!(legacy.packed_domains, 0);
+        let added = dispatch(
+            "batch_add_rules",
+            &json!({"text":legacy.text, "group":"Old", "group_only":true}),
+        );
+        assert_eq!(added["ok"], true, "{added}");
+        let preview = preview_rule_list_bytes(cn, "direct", "CN").unwrap();
+        assert_eq!(preview.packed_domains, 110_177);
+        assert_eq!(preview.count, 27);
+        assert!(preview.skipped.is_empty());
+        let token = rule_preview_cache::store(&preview.text).unwrap();
+        let request = json!({"preview_token":token, "group":"CN", "group_only":true});
+        let added = dispatch("batch_add_rules", &request);
+        assert_eq!(added["ok"], true, "{added}");
+        let written = fs::read(conf_path()).unwrap();
+        assert_eq!(dispatch("batch_add_rules", &request)["ok"], true);
+        assert_eq!(fs::read(conf_path()).unwrap(), written);
+        let rules = load_routing_rules(&load_conf().unwrap());
+        assert_eq!(rules.len(), 29);
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|r| r.group == "CN")
+                .map(|r| r.pattern.split('|').count())
+                .sum::<usize>(),
+            110_177
+        );
+        let router = Router::new(RuleSet::from_config(&rules));
+        assert_eq!(router.route("www.baidu.com", 443), RouteAction::Direct);
+        assert_eq!(router.route("baidu.com", 443), RouteAction::Direct);
+        assert_eq!(router.route("notbaidu.invalid", 443), RouteAction::Proxy);
+        assert_eq!(router.route("legacy.example", 443), RouteAction::Reject);
+        assert_eq!(router.route("192.0.2.1", 443), RouteAction::Direct);
+        fs::remove_dir_all(rule_preview_cache::root()).unwrap();
     }
 
     #[test]

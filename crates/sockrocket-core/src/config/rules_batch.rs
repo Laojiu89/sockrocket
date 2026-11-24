@@ -262,13 +262,80 @@ pub fn merge_rules(
     stats
 }
 
+/// A packed member and its original standalone rule have the same duplicate
+/// identity. Compare borrowed names before changing the incoming patterns.
+fn remove_packed_duplicates(
+    existing: &[RoutingRule],
+    incoming: &mut Vec<RoutingRule>,
+    within_group: bool,
+) {
+    if !existing
+        .iter()
+        .chain(incoming.iter())
+        .any(|r| r.rule_type == "domain-set")
+    {
+        return;
+    }
+    let mut scopes = std::collections::HashMap::new();
+    let mut replacements = Vec::new();
+    for (index, rule) in existing
+        .iter()
+        .map(|r| (None, r))
+        .chain(incoming.iter().enumerate().rev().map(|(i, r)| (Some(i), r)))
+    {
+        let group = if within_group { rule.group.trim() } else { "" };
+        let seen = scopes
+            .entry((group, rule.source.as_str()))
+            .or_insert_with(std::collections::HashSet::new);
+        match rule.rule_type.as_str() {
+            "domain" | "domain-suffix" => {
+                if !seen.insert((rule.rule_type == "domain-suffix", rule.pattern.as_str()))
+                    && let Some(i) = index
+                {
+                    replacements.push((i, String::new()));
+                }
+            }
+            "domain-set" => {
+                let mut members = Vec::new();
+                let mut duplicate = false;
+                for member in rule.pattern.split('|') {
+                    let suffix = member.strip_prefix("+.");
+                    if seen.insert((suffix.is_some(), suffix.unwrap_or(member))) {
+                        if index.is_some() {
+                            members.push(member);
+                        }
+                    } else {
+                        duplicate = true;
+                    }
+                }
+                if duplicate && let Some(i) = index {
+                    replacements.push((i, members.join("|")));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, pattern) in replacements {
+        incoming[i].pattern = pattern;
+    }
+    incoming.retain(|r| {
+        !r.pattern.is_empty()
+            || !matches!(
+                r.rule_type.as_str(),
+                "domain-set" | "domain" | "domain-suffix"
+            )
+    });
+}
+
 /// A large imported list commonly has one priority and thousands of new IPs.
 /// Index duplicate keys before moving the rules, then merge in a single pass.
 fn insert_new_rules(
     existing: &mut Vec<RoutingRule>,
-    incoming: Vec<RoutingRule>,
+    mut incoming: Vec<RoutingRule>,
     within_group: bool,
 ) -> BatchMergeStats {
+    let total = incoming.len();
+    remove_packed_duplicates(existing, &mut incoming, within_group);
     fn key(rule: &RoutingRule, within_group: bool) -> (&str, &str, &str, &str) {
         (
             if within_group { rule.group.trim() } else { "" },
@@ -288,7 +355,6 @@ fn insert_new_rules(
             keep[index] = seen.insert(key(rule, within_group));
         }
     }
-    let total = incoming.len();
     let mut new: Vec<_> = incoming
         .into_iter()
         .zip(keep)
@@ -451,19 +517,13 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
             }
         }
         "ip-cidr" => normalize_cidr(pattern)?,
-        "domain" | "domain-suffix" => {
-            let mut s = pattern.trim().trim_start_matches('.').to_lowercase();
-            if !s.is_ascii() {
-                s = match url::Host::parse(&s) {
-                    Ok(url::Host::Domain(domain)) => domain,
-                    _ => return Err(format!("Invalid domain '{pattern}'")),
-                };
-            }
-            if !looks_like_domain(&s) {
-                return Err(format!("Invalid domain '{pattern}'"));
-            }
-            s
-        }
+        "domain" | "domain-suffix" => normalize_domain(pattern)?,
+        "domain-set" => domain_set_members(pattern)
+            .map(|member| {
+                member.map(|(suffix, name)| if suffix { format!("+.{name}") } else { name })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join("|"),
         "domain-keyword" => {
             let s = pattern.trim().to_lowercase();
             if s.is_empty() || s.chars().any(char::is_whitespace) {
@@ -495,6 +555,7 @@ fn build_rule(rule_type: &str, pattern: &str, target: &str) -> Result<RoutingRul
 fn known_rule_type(s: &str) -> Option<&'static str> {
     Some(match s.to_ascii_lowercase().as_str() {
         "domain" => "domain",
+        "domain-set" => "domain-set",
         "domain-suffix" | "domain_suffix" | "domainsuffix" => "domain-suffix",
         "domain-keyword" | "domain_keyword" | "domainkeyword" => "domain-keyword",
         "ip-cidr" | "ip_cidr" | "ipcidr" => "ip-cidr",
@@ -524,6 +585,7 @@ fn normalize_target(s: &str) -> Option<&str> {
 fn export_type(t: &str) -> &'static str {
     match t {
         "domain" => "DOMAIN",
+        "domain-set" => "DOMAIN-SET",
         "domain-suffix" => "DOMAIN-SUFFIX",
         "domain-keyword" => "DOMAIN-KEYWORD",
         "ip-cidr" => "IP-CIDR",
@@ -543,6 +605,35 @@ fn export_target(t: &str) -> &str {
         "reject" => "REJECT",
         _ => "PROXY",
     }
+}
+
+pub(crate) const DOMAIN_SET_SIZE: usize = 4096;
+
+pub(crate) fn domain_set_members(
+    pattern: &str,
+) -> impl Iterator<Item = Result<(bool, String), String>> + '_ {
+    pattern.split('|').enumerate().map(|(i, member)| {
+        let suffix = member.starts_with("+.");
+        let name = member.strip_prefix("+.").unwrap_or(member);
+        if name.is_empty() || name.starts_with('.') || i >= DOMAIN_SET_SIZE {
+            return Err("Invalid domain set member or too many domains".into());
+        }
+        Ok((suffix, normalize_domain(name)?))
+    })
+}
+
+fn normalize_domain(pattern: &str) -> Result<String, String> {
+    let mut s = pattern.trim().trim_start_matches('.').to_lowercase();
+    if !s.is_ascii() {
+        s = match url::Host::parse(&s) {
+            Ok(url::Host::Domain(domain)) => domain,
+            _ => return Err(format!("Invalid domain '{pattern}'")),
+        };
+    }
+    if !looks_like_domain(&s) {
+        return Err(format!("Invalid domain '{pattern}'"));
+    }
+    Ok(s)
 }
 
 fn looks_like_domain(s: &str) -> bool {
@@ -601,6 +692,47 @@ fn valid_port_pattern(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_domains_round_trip_with_exact_and_suffix_semantics() {
+        use crate::router::{RouteAction, Router, RuleSet};
+        let rule =
+            make_typed_rule("domain-set", "API.Example|+.例子.测试", "direct", "CN").unwrap();
+        let text = format_rule_clash_line(&rule);
+        let parsed = parse_batch_rules_in_group(&text, "proxy", "CN");
+        assert!(parsed.errors.is_empty());
+        assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].pattern, rule.pattern);
+        let router = Router::new(RuleSet::from_config(&parsed.rules));
+        for host in [
+            "api.example",
+            "xn--fsqu00a.xn--0zwm56d",
+            "sub.xn--fsqu00a.xn--0zwm56d",
+        ] {
+            assert_eq!(router.route(host, 443), RouteAction::Direct);
+        }
+        assert_eq!(router.route("sub.api.example", 443), RouteAction::Proxy);
+        assert!(
+            make_typed_rule("domain-set", "api.example||+.other.example", "direct", "CN").is_err()
+        );
+    }
+
+    #[test]
+    fn packed_and_plain_domains_skip_duplicate_members_in_the_same_group() {
+        let parse = |text| parse_batch_rules_in_group(text, "proxy", "CN").rules;
+        let mut existing = parse("DOMAIN-SUFFIX,old.test,REJECT");
+        let packed = parse("DOMAIN-SET,+.old.test|+.new.test|exact.test,DIRECT");
+        merge_rules(&mut existing, packed, BatchConflict::Skip, true);
+        assert_eq!(existing[0].pattern, "+.new.test|exact.test");
+        assert_eq!(existing[1].target, "reject");
+        let added = merge_rules(
+            &mut existing,
+            parse("DOMAIN,exact.test,PROXY\nDOMAIN,new.test,PROXY"),
+            BatchConflict::Skip,
+            true,
+        );
+        assert_eq!((added.added, added.skipped), (1, 1));
+    }
 
     #[test]
     fn csv_lists_inherit_selected_exit_and_normalize_idn() {

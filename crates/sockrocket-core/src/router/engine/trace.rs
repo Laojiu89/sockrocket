@@ -166,6 +166,7 @@ fn push_builtin(trace: &mut RouteTrace, checked: usize, needs_ip: bool) {
 
 fn step(entry: RuleView<'_>, outcome: &'static str) -> RouteTraceStep {
     let (rule_type, pattern) = match entry.rule {
+        MatchRule::DomainSet(set) => ("domain-set", format!("{} 个域名", set.len())),
         MatchRule::Domain(p) => ("domain", p.clone()),
         MatchRule::DomainSuffix(p) => ("domain-suffix", p.trim_start_matches('.').into()),
         MatchRule::DomainKeyword(p) => ("domain-keyword", p.clone()),
