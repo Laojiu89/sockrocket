@@ -189,6 +189,7 @@ pub(super) async fn serve(
     remaining: &[u8],
     outbound: SharedOutbound,
     stats: ProxyStats,
+    auth: Option<&super::listeners::ListenerAuth>,
 ) -> Result<()> {
     let mut prefix = header.to_vec();
     prefix.extend_from_slice(remaining);
@@ -199,10 +200,24 @@ pub(super) async fn serve(
     let record = stats.track("HTTP requests".into(), "HTTP");
     let tasks = Arc::new(Mutex::new(tokio::task::JoinSet::new()));
     let owned = tasks.clone();
-    let service = hyper::service::service_fn(move |request| {
+    let service = hyper::service::service_fn(move |request: Request<Incoming>| {
         let outbound = outbound.clone();
         let tasks = owned.clone();
         async move {
+            if auth.is_some_and(|auth| {
+                !request
+                    .headers()
+                    .get("proxy-authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| auth.verify_basic(value))
+            }) {
+                let mut response = empty(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+                response.headers_mut().insert(
+                    "proxy-authenticate",
+                    http::HeaderValue::from_static("Basic realm=\"Sockrocket\""),
+                );
+                return Ok::<_, Infallible>(response);
+            }
             Ok::<_, Infallible>(match forward(request, outbound, tasks).await {
                 Ok(response) => response,
                 Err(_) => empty(StatusCode::BAD_GATEWAY),

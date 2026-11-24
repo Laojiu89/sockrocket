@@ -16,6 +16,8 @@ merlin_arm64_cargo_flags=(
 # Keep O3 on the forwarding path and fold address-insignificant sections.
 merlin_arm64_flags=(
   -C llvm-args=--inline-threshold=80
+  # Share repeated AArch64 instruction sequences after inlining.
+  -C llvm-args=--enable-machine-outliner=always
   -C llvm-args=--addrsig
   -C link-arg=--icf=safe
   -C link-self-contained=yes

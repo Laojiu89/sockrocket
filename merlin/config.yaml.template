@@ -7,6 +7,8 @@
 listen_addr: "0.0.0.0"     # Router mode listens on all interfaces
 socks_port: 1080
 http_port: 1087
+# Additional inbound listeners are managed under 节点 → 入站监听. Each entry has its own exit.
+listeners: []
 dns_port: 5300             # Sockrocket built-in DNS listen port (dnsmasq forwards DNS queries here)
 dns_direct_server: "114.114.114.114"   # DNS server for direct domains (China ISP DNS)
 # api_port: 18188          # Internal loopback-only, token-protected API port.

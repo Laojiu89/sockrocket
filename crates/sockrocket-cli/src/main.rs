@@ -13,6 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use sockrocket_core::config::listeners::ListenerExit;
+use sockrocket_core::proxy::listeners::{ListenerProxy, ListenerService};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
@@ -429,6 +431,13 @@ async fn async_main() -> Result<()> {
             fakeip_pool.clone(),
         )
         .await?;
+    let mut listeners = ListenerService::new(
+        swappable.clone(),
+        service.stats().clone(),
+        fakeip_pool.clone(),
+    );
+    let initial_proxy = listener_proxy(&config, active_index);
+    let inbound_start = listeners.apply(&config.listeners, initial_proxy).await;
 
     // Proxy-server hostnames, shared with the DNS resolver so node servers
     // always resolve direct/real (never fake-IP). Repopulated on config
@@ -638,6 +647,10 @@ async fn async_main() -> Result<()> {
 
     let diagnostic_stats = service.stats().clone();
     update_health_state(|health| health.config_apply = Default::default());
+    if let Err(error) = inbound_start {
+        let _rejected = config_apply::ApplyAttempt::begin(&[]);
+        tracing::error!("入站监听启动失败：{error:#}");
+    }
     spawn_background(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -857,6 +870,11 @@ async fn async_main() -> Result<()> {
                                     new_config.ipv6_mode,
                                     &config_path,
                                 );
+                                let proxy = listener_proxy(&new_config, new_index);
+                                if let Err(error) = listeners.apply(&new_config.listeners, proxy).await {
+                                    tracing::error!("入站监听更新失败：{error:#}");
+                                    continue;
+                                }
                                 if let Err(error) = sockrocket_core::dns::configure_bootstrap(
                                     &settings,
                                     new_config.nodes.iter().map(|node| node.server.clone()),
@@ -899,7 +917,7 @@ async fn async_main() -> Result<()> {
                                 }
                                 sync_traffic_node(&traffic_ledger, &new_config, new_index);
                                 tracing::info!(
-                                    "config reloaded: {} node(s), active index {:?} (listeners unchanged)",
+                                    "config reloaded: {} node(s), active index {:?}",
                                     new_config.nodes.len(),
                                     new_index
                                 );
@@ -931,6 +949,7 @@ async fn async_main() -> Result<()> {
     }
     tracing::info!("Shutdown signal received");
     config_watcher.shutdown();
+    drop(listeners);
 
     // Stop the DNS listener before the proxy/TUN so dnsmasq's forwarded
     // queries fail fast instead of hitting a half-torn-down resolver.
@@ -1427,6 +1446,24 @@ fn build_outbound(
     };
 
     Ok(wrap_with_rules(base_outbound, router, config))
+}
+
+fn listener_proxy(config: &AppConfig, index: Option<usize>) -> ListenerProxy {
+    if config.proxy_mode != ProxyMode::Direct {
+        return ListenerProxy::Active;
+    }
+    let node = index.and_then(|i| config.nodes.get(i)).filter(|_| {
+        config
+            .listeners
+            .iter()
+            .any(|entry| entry.enabled && entry.exit == ListenerExit::Proxy)
+    });
+    ListenerProxy::Fixed(node.and_then(|node| {
+        sockrocket_core::create_outbound_unwarmed(node)
+            .inspect_err(|error| tracing::warn!("入站代理出口不可用：{error:#}"))
+            .ok()
+            .filter(|outbound| !outbound.0.is_direct())
+    }))
 }
 
 /// Router for the configured [`ProxyMode`].

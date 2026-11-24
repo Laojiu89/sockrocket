@@ -18,6 +18,7 @@
 
 mod devices;
 mod http;
+mod listeners;
 mod network_settings;
 mod proxy_groups;
 mod route_trace;
@@ -427,6 +428,7 @@ fn load_conf() -> Result<Mapping> {
 
 fn save_conf(map: &Mapping) -> Result<()> {
     devices::paused_sources(map)?;
+    listeners::validate(map)?;
     let groups = sockrocket_core::config::model::proxy_groups_from_yaml(map)
         .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
     let rules = load_routing_rules(map);
@@ -544,6 +546,7 @@ fn read_only_action(action: &str) -> bool {
             | "fetch_rule_list"
             | "trace_route"
             | "proxy_groups"
+            | "listeners"
             | "network_settings"
             | "dns_test"
             | "export_rules"
@@ -618,6 +621,9 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "del_direct_domain" => act_del_direct_domain(post),
         "set_direct_server" => act_set_direct_server(post),
         "proxy_groups" => proxy_groups::get(),
+        "listeners" => listeners::list(),
+        "save_listener" => listeners::mutate(post, false),
+        "delete_listener" => listeners::mutate(post, true),
         "save_proxy_group" => proxy_groups::save(post),
         "delete_proxy_group" => proxy_groups::delete(post),
         "save_device_binding" => devices::save_binding(post),
@@ -915,6 +921,9 @@ fn act_save_config(post: &J) -> J {
 fn validate_advanced_config(text: &str) -> Result<()> {
     let raw = parse_yaml_document(text)?;
     let map = raw.as_mapping();
+    if let Some(map) = map {
+        listeners::validate(map)?;
+    }
     let ipset_direct = map.is_some_and(|map| conf_bool(map, "cn_ipset_direct", false));
     let transparent = map.is_none_or(|map| effective_toggles(map).0);
     let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw);
@@ -942,14 +951,31 @@ fn validate_advanced_config(text: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct SubscriptionCatalog {
+    nodes: Y,
+    subscriptions: Y,
+}
+
+fn read_subscription_catalog() -> Result<SubscriptionCatalog> {
+    // Listing subscriptions needs no routing rules, device bindings or node-ID migration.
+    let content = fs::read(conf_path())?;
+    Ok(serde_yaml::from_slice::<Option<SubscriptionCatalog>>(&content)?.unwrap_or_default())
+}
+
 fn act_subscriptions() -> J {
-    let Ok(map) = load_conf() else {
+    let Ok(catalog) = read_subscription_catalog() else {
         return err_msg("无法读取订阅配置，请检查配置文件后刷新。");
     };
     let mut node_counts = std::collections::HashMap::<String, usize>::new();
     let mut shared_nodes = 0usize;
-    for value in conf_seq(&map, "nodes") {
-        let Ok(node) = sockrocket_core::Node::from_yaml_value(value.clone()) else {
+    let nodes = match catalog.nodes {
+        Y::Sequence(nodes) => nodes,
+        _ => Vec::new(),
+    };
+    for value in nodes {
+        let Ok(node) = sockrocket_core::Node::from_yaml_value(value) else {
             continue;
         };
         let sources = sockrocket_core::config::dedup::subscription_sources(&node);
@@ -960,8 +986,11 @@ fn act_subscriptions() -> J {
             *node_counts.entry(source).or_default() += 1;
         }
     }
-    let subs: Vec<J> = conf_seq(&map, "subscriptions")
-        .iter()
+    let subs: Vec<J> = catalog
+        .subscriptions
+        .as_sequence()
+        .into_iter()
+        .flatten()
         .enumerate()
         .map(|(i, s)| {
             let get = |k: &str| match s.get(k) {
@@ -4428,6 +4457,57 @@ mod tests {
     }
 
     #[test]
+    fn listener_editor_round_trips_without_disclosing_password() {
+        let _env = TestEnv::new(SAMPLE);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let revision = dispatch("listeners", &json!({}))["revision"].clone();
+        let mut row = json!({
+            "name":"living-room", "type":"mixed", "listen":"127.0.0.1", "port":port,
+            "exit":"direct", "username":"lan", "password":"private-credential",
+        });
+        let add = json!({"revision":revision, "listener":row});
+        assert_eq!(dispatch("save_listener", &add)["ok"], true);
+        assert_eq!(dispatch("save_listener", &add)["ok"], false);
+        let list = dispatch("listeners", &json!({}));
+        assert!(!list.to_string().contains("private-credential"));
+        assert_eq!(list["listeners"][0]["has_password"], true);
+
+        row["exit"] = json!("proxy");
+        row["password"] = json!("");
+        assert_eq!(
+            dispatch(
+                "save_listener",
+                &json!({
+                    "revision":list["revision"], "original_name":"living-room", "listener":row,
+                })
+            )["ok"],
+            true
+        );
+        let map = load_conf().unwrap();
+        let saved = sockrocket_core::config::listeners::listeners_from_yaml(&map).unwrap();
+        assert_eq!(
+            saved[0].exit,
+            sockrocket_core::config::listeners::ListenerExit::Proxy
+        );
+        assert_eq!(saved[0].password, "private-credential");
+        let revision = dispatch("listeners", &json!({}))["revision"].clone();
+        assert_eq!(
+            dispatch(
+                "delete_listener",
+                &json!({
+                    "revision":revision, "original_name":"living-room",
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch("listeners", &json!({}))["listeners"], json!([]));
+    }
+
+    #[test]
     fn default_groups_save_independently_and_route_after_reload() {
         let _env = TestEnv::new(&SAMPLE.replace("rules: []", "cn_ipset_direct: true\nrules:\n  - {rule_type: final, pattern: '*', target: direct, group: Original}\n  - {rule_type: final, pattern: '*', target: reject, enabled: false, group: Backup}"));
         let before = act_get_rules();
@@ -5275,6 +5355,26 @@ dns_direct_domains:
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["name"], J::from("Sub 2"));
+    }
+
+    #[test]
+    fn subscription_list_counts_valid_legacy_nodes_with_groups() {
+        let config = r#"
+subscriptions:
+  - {name: Legacy, url: 'https://example.invalid/sub'}
+nodes:
+  - name: Valid
+    server: node.example.invalid
+    port: 443
+    protocol: {type: trojan, password: synthetic}
+    extra: &source {sub_url: 'https://example.invalid/sub'}
+  - {name: Incomplete, extra: *source}
+groups: [{name: Main, members: []}]
+"#;
+        let _env = TestEnv::new(config);
+        let result = act_subscriptions();
+        assert_eq!(result["subs"][0]["node_count"], 1);
+        assert_eq!(result["shared_nodes"], 0);
     }
 
     #[test]

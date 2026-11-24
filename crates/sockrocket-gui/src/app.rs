@@ -91,6 +91,7 @@ pub struct AppState {
 
     // Settings (applied values)
     pub(crate) listen_addr: String,
+    listeners: Vec<sockrocket_core::config::listeners::ListenerConfig>,
     pub(crate) socks_port: u16,
     pub(crate) http_port: u16,
     pub(crate) dns: Option<sockrocket_core::config::dns::DnsSettings>,
@@ -752,6 +753,7 @@ impl AppState {
             update_download_url: None,
             rules_status: String::new(),
             listen_addr: persisted.listen_addr,
+            listeners: persisted.listeners,
             socks_port: persisted.socks_port,
             http_port: persisted.http_port,
             dns: persisted.dns.clone(),
@@ -3586,6 +3588,7 @@ impl AppState {
     pub(crate) fn snapshot_config(&self) -> AppConfig {
         AppConfig {
             listen_addr: self.listen_addr.clone(),
+            listeners: self.listeners.clone(),
             socks_port: self.socks_port,
             http_port: self.http_port,
             dns: self.dns.clone(),
@@ -3734,6 +3737,7 @@ impl AppState {
                         this.subscriptions = config.subscriptions;
                         this.groups = config.groups;
                         this.paused_device_sources = config.paused_device_sources;
+                        this.listeners = config.listeners;
                         this.device_rule_groups = config.device_rule_groups;
                         (this.rules, this.router_rules) =
                             sockrocket_gui::desktop_rules::split(config.rules);
@@ -4025,6 +4029,7 @@ impl AppState {
                 self.explicit_group_bindings = new_config.explicit_group_bindings;
                 self.builtin_route = new_config.builtin_route;
                 self.paused_device_sources = new_config.paused_device_sources.clone();
+                self.listeners.clone_from(&new_config.listeners);
                 self.device_rule_groups = new_config.device_rule_groups.clone();
                 self.dns = new_config.dns.clone();
                 self.ipv6_mode = new_config.ipv6_mode;

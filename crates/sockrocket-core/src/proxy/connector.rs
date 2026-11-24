@@ -466,6 +466,17 @@ impl SwappableOutbound {
     pub fn current(&self) -> SharedOutbound {
         self.inner.read().unwrap().outbound.clone()
     }
+
+    pub(super) fn listener_snapshot(
+        &self,
+        select: impl FnOnce(&SharedOutbound) -> Option<SharedOutbound>,
+    ) -> Option<SharedOutbound> {
+        let state = self.inner.read().unwrap();
+        Some(SharedOutbound(Arc::new(PolicyOutbound {
+            inner: select(&state.outbound)?,
+            resolver: state.resolver.clone(),
+        })))
+    }
 }
 
 impl Outbound for SwappableOutbound {

@@ -32,7 +32,13 @@ impl SsOutbound {
         let server_config = ServerConfig::new(server_addr, password, method)
             .map_err(|e| anyhow::anyhow!("Invalid SS server config: {}", e))?;
 
-        let context = Context::new_shared(ServerType::Local);
+        // Enabling replay detection allocates a filter per Context. Share it
+        // across outbound nodes rather than charging each subscription entry.
+        static CLIENT_CONTEXT: std::sync::OnceLock<shadowsocks::context::SharedContext> =
+            std::sync::OnceLock::new();
+        let context = CLIENT_CONTEXT
+            .get_or_init(|| Context::new_shared(ServerType::Local))
+            .clone();
 
         Ok(Self {
             server_config,

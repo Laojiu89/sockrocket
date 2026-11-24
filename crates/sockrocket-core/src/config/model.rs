@@ -89,6 +89,8 @@ pub struct AppConfig {
     pub socks_port: u16,
     /// Local HTTP proxy port
     pub http_port: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<super::listeners::ListenerConfig>,
     /// Shared DNS policy. None preserves legacy router keys and defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<super::dns::DnsSettings>,
@@ -144,6 +146,7 @@ impl Default for AppConfig {
             listen_addr: "127.0.0.1".to_string(),
             socks_port: 1080,
             http_port: 1087,
+            listeners: Vec::new(),
             dns: None,
             ipv6_mode: super::dns::Ipv6Mode::default(),
             proxy_mode: ProxyMode::default(),
@@ -212,6 +215,15 @@ impl AppConfig {
     pub fn from_yaml_value(mut raw: serde_yaml::Value) -> Result<Self, serde_yaml::Error> {
         super::node_identity::migrate_references(&mut raw)?;
         let legacy_mode = raw.get("proxy_mode").is_none();
+        // Router-only ports are intentionally absent from the desktop config model.
+        let router_port = |key: &str| {
+            raw.get(key)
+                .and_then(serde_yaml::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(0)
+        };
+        let dns_port = router_port("dns_port");
+        let api_port = router_port("api_port");
         let mut cfg = Self::decode_yaml_fields(raw)?;
         if legacy_mode {
             cfg.proxy_mode = ProxyMode::Rule;
@@ -220,6 +232,11 @@ impl AppConfig {
             .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         validate_device_rule_groups(&cfg.device_rule_groups, &cfg.rules, &cfg.groups)
             .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
+        super::listeners::validate_listeners(
+            &cfg.listeners,
+            &[cfg.socks_port, cfg.http_port, dns_port, api_port],
+        )
+        .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         Ok(cfg)
     }
 }
