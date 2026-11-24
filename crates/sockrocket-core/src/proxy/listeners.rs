@@ -88,14 +88,20 @@ impl Protocol {
             ListenerType::Socks => Self::Socks(auth()),
             ListenerType::Mixed => Self::Mixed(auth()),
             ListenerType::Shadowsocks => {
-                let mut context = Context::new(ServerType::Server);
-                context.set_replay_attack_policy(ReplayAttackPolicy::Reject);
+                // Share the bounded salt filter across ports and preserve it on reload.
+                static SERVER_CONTEXT: std::sync::OnceLock<SharedContext> =
+                    std::sync::OnceLock::new();
+                let context = SERVER_CONTEXT.get_or_init(|| {
+                    let mut context = Context::new(ServerType::Server);
+                    context.set_replay_attack_policy(ReplayAttackPolicy::Reject);
+                    Arc::new(context)
+                });
                 let cipher = config
                     .cipher
                     .parse()
                     .map_err(|_| anyhow::anyhow!("无效的 Shadowsocks 加密方式"))?;
                 let server = ServerConfig::new(config.address(), &config.password, cipher)?;
-                Self::Shadowsocks(Arc::new(context), server)
+                Self::Shadowsocks(context.clone(), server)
             }
         })
     }
@@ -156,10 +162,30 @@ impl Protocol {
     }
 }
 
+/// Active follows runtime failover. Fixed is also used when direct mode has a
+/// separately configured node, or when that node is unavailable.
+#[derive(Clone)]
+pub enum ListenerProxy {
+    Active,
+    Fixed(Option<SharedOutbound>),
+}
+
+impl ListenerProxy {
+    fn snapshot(&self, source: &SwappableOutbound) -> Option<SharedOutbound> {
+        source.listener_snapshot(|current| match self {
+            Self::Fixed(outbound) => outbound.clone(),
+            Self::Active => {
+                let proxy = current.0.default_proxy().unwrap_or_else(|| current.clone());
+                (!proxy.0.is_direct()).then_some(proxy)
+            }
+        })
+    }
+}
+
 #[derive(Clone)]
 struct ListenerPolicy {
     protocol: Arc<Protocol>,
-    outbound: Option<SharedOutbound>,
+    outbound: ListenerProxy,
 }
 
 struct RunningListener {
@@ -196,12 +222,11 @@ impl ListenerService {
         }
     }
 
-    pub async fn apply(
-        &mut self,
-        configs: &[ListenerConfig],
-        proxy: Option<SharedOutbound>,
-    ) -> Result<()> {
+    pub async fn apply(&mut self, configs: &[ListenerConfig], proxy: ListenerProxy) -> Result<()> {
         let mut pending = Vec::new();
+        let mut sockets = HashMap::new();
+        let mut replacements = Vec::new();
+        let mut displaced = std::collections::HashSet::new();
         for config in configs.iter().filter(|config| config.enabled) {
             let address = config.address();
             let existing = self
@@ -220,46 +245,65 @@ impl ListenerService {
                 _ => Arc::new(Protocol::from_config(config)?),
             };
             let outbound = match config.exit {
-                ListenerExit::Direct => Some(SharedOutbound::direct()),
+                ListenerExit::Direct => ListenerProxy::Fixed(Some(SharedOutbound::direct())),
                 ListenerExit::Proxy => proxy.clone(),
             };
-            let socket = match existing {
-                Some(_) => None,
-                None => Some(
-                    TcpListener::bind(address)
-                        .await
-                        .with_context(|| format!("无法监听入站 {address}"))?,
-                ),
-            };
-            pending.push((
-                config.clone(),
-                ListenerPolicy { protocol, outbound },
-                socket,
-            ));
+            if existing.is_none() {
+                let mut conflicts = self
+                    .active
+                    .keys()
+                    .copied()
+                    .filter(|old| {
+                        *old != address && crate::config::listeners::overlaps(*old, address)
+                    })
+                    .peekable();
+                if conflicts.peek().is_none() {
+                    sockets.insert(address, bind(address).await?);
+                } else {
+                    displaced.extend(conflicts);
+                    replacements.push(address);
+                }
+            }
+            pending.push((config.clone(), ListenerPolicy { protocol, outbound }));
         }
 
-        // Bind every new address before changing any running listener.
+        // Wildcard/specific swaps cannot coexist at the same port. Release
+        // just their accept tasks after prebinding all independent addresses.
+        let mut stopped = Vec::new();
+        for address in displaced {
+            if let Some(mut old) = self.active.remove(&address) {
+                old.task.abort();
+                let _ = (&mut old.task).await;
+                stopped.push((old.config.clone(), old.settings.borrow().clone()));
+            }
+        }
+        for address in replacements {
+            match bind(address).await {
+                Ok(socket) => {
+                    sockets.insert(address, socket);
+                }
+                Err(error) => {
+                    drop(sockets);
+                    let mut failed = Vec::new();
+                    for (config, policy) in stopped {
+                        match bind(config.address()).await {
+                            Ok(socket) => self.start(config, policy, socket),
+                            Err(restore) => failed.push(restore.to_string()),
+                        }
+                    }
+                    if !failed.is_empty() {
+                        return Err(error.context(format!("恢复原入站失败：{}", failed.join("、"))));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         self.active
             .retain(|address, _| configs.iter().any(|c| c.enabled && c.address() == *address));
-        for (config, policy, socket) in pending {
-            if let Some(socket) = socket {
-                let (settings, receiver) = watch::channel(policy);
-                let task = tokio::spawn(run(
-                    socket,
-                    receiver,
-                    self.dns_source.clone(),
-                    self.stats.clone(),
-                    self.pool.clone(),
-                ));
-                tracing::info!(name = %config.name, address = %config.address(), "Inbound listener ready");
-                self.active.insert(
-                    config.address(),
-                    RunningListener {
-                        config,
-                        settings,
-                        task,
-                    },
-                );
+        for (config, policy) in pending {
+            if let Some(socket) = sockets.remove(&config.address()) {
+                self.start(config, policy, socket);
             } else if let Some(entry) = self.active.get_mut(&config.address()) {
                 entry.config = config;
                 entry.settings.send_replace(policy);
@@ -267,6 +311,32 @@ impl ListenerService {
         }
         Ok(())
     }
+
+    fn start(&mut self, config: ListenerConfig, policy: ListenerPolicy, socket: TcpListener) {
+        let (settings, receiver) = watch::channel(policy);
+        let task = tokio::spawn(run(
+            socket,
+            receiver,
+            self.dns_source.clone(),
+            self.stats.clone(),
+            self.pool.clone(),
+        ));
+        tracing::info!(name = %config.name, address = %config.address(), "Inbound listener ready");
+        self.active.insert(
+            config.address(),
+            RunningListener {
+                config,
+                settings,
+                task,
+            },
+        );
+    }
+}
+
+async fn bind(address: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(address)
+        .await
+        .with_context(|| format!("无法监听入站 {address}"))
 }
 
 async fn run(
@@ -284,20 +354,26 @@ async fn run(
                 let (stream, peer) = match accepted {
                     Ok(pair) => pair,
                     Err(error) => {
-                        tracing::error!(%error, "Inbound listener stopped accepting connections");
-                        break;
+                        tracing::warn!(%error, "Inbound accept failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
                     }
                 };
                 let policy = settings.borrow().clone();
-                let Some(outbound) = policy.outbound else { continue };
+                let Some(outbound) = policy.outbound.snapshot(&dns_source) else { continue };
                 let Some(slot) = stats.try_slot() else { continue };
-                let outbound = dns_source.with_dns_policy(outbound);
+                let direct = outbound.0.is_direct();
                 stream.set_nodelay(true).ok();
                 let stats = stats.clone();
                 let pool = pool.clone();
                 connections.spawn(async move {
                     let _slot = slot;
-                    let connection = policy.protocol.serve(stream, outbound, stats, pool);
+                    let connection = async {
+                        if direct {
+                            crate::traffic::note_traffic(crate::traffic::direct_traffic_target());
+                        }
+                        policy.protocol.serve(stream, outbound, stats, pool).await
+                    };
                     let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(connection)).await;
                     if let Err(error) = result { tracing::debug!(%peer, %error, "Inbound connection closed"); }
                 });
@@ -400,6 +476,73 @@ mod tests {
         assert_eq!(payload, [marker, b'x']);
     }
 
+    #[test]
+    fn active_listener_follows_runtime_switch_without_config_reload() {
+        let source = SwappableOutbound::new(SharedOutbound::direct());
+        assert!(ListenerProxy::Active.snapshot(&source).is_none());
+        source.set(SharedOutbound(Arc::new(ProxyTo(
+            "127.0.0.1:42".parse().unwrap(),
+        ))));
+        assert_eq!(
+            ListenerProxy::Active.snapshot(&source).unwrap().0.name(),
+            "test proxy"
+        );
+        source.set(SharedOutbound::direct());
+        assert!(ListenerProxy::Active.snapshot(&source).is_none());
+    }
+
+    #[test]
+    fn shadowsocks_server_keeps_replay_protection_across_reload() {
+        let config: ListenerConfig = serde_yaml::from_str(
+            "name: ss\ntype: shadowsocks\nport: 1234\nexit: direct\ncipher: aes-128-gcm\npassword: test",
+        ).unwrap();
+        let Protocol::Shadowsocks(first, server) = Protocol::from_config(&config).unwrap() else {
+            unreachable!()
+        };
+        let Protocol::Shadowsocks(next, _) = Protocol::from_config(&config).unwrap() else {
+            unreachable!()
+        };
+        let salt = rand::random::<[u8; 16]>();
+        assert!(first.check_nonce_replay(server.method(), &salt).is_ok());
+        assert!(next.check_nonce_replay(server.method(), &salt).is_err());
+    }
+
+    #[tokio::test]
+    async fn listener_changes_between_wildcard_and_local_address_on_same_port() {
+        let mut cfg = config(ListenerType::Http).await;
+        let mut service = service();
+        for ip in ["0.0.0.0", "127.0.0.1", "0.0.0.0"] {
+            cfg.listen = ip.parse().unwrap();
+            service
+                .apply(std::slice::from_ref(&cfg), ListenerProxy::Active)
+                .await
+                .unwrap();
+            assert_eq!(service.active.len(), 1);
+            assert!(service.active.contains_key(&cfg.address()));
+            let client = TcpStream::connect(("127.0.0.1", cfg.port)).await.unwrap();
+            drop(client);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_listener_expansion_restores_the_local_socket() {
+        let mut cfg = config(ListenerType::Http).await;
+        let mut service = service();
+        service
+            .apply(std::slice::from_ref(&cfg), ListenerProxy::Active)
+            .await
+            .unwrap();
+        let local = cfg.address();
+        let occupied = TcpListener::bind(("127.0.0.2", cfg.port)).await.unwrap();
+        cfg.listen = "0.0.0.0".parse().unwrap();
+        assert!(service.apply(&[cfg], ListenerProxy::Active).await.is_err());
+        assert!(service.active.contains_key(&local));
+        let dest = echo(b'D').await;
+        http_exchange(local, dest, true, b'D').await;
+        drop(occupied);
+    }
+
     #[tokio::test]
     async fn listener_mixed_auth_routes_and_hot_reloads() {
         tokio::time::timeout(std::time::Duration::from_secs(8), async {
@@ -408,7 +551,7 @@ mod tests {
             let mut config = config(ListenerType::Mixed).await;
             let address = config.address();
             let mut service = service();
-            let selected = Some(SharedOutbound(Arc::new(ProxyTo(proxy))));
+            let selected = ListenerProxy::Fixed(Some(SharedOutbound(Arc::new(ProxyTo(proxy)))));
             service
                 .apply(std::slice::from_ref(&config), selected.clone())
                 .await
@@ -459,7 +602,7 @@ mod tests {
             let address = config.address();
             let mut service = service();
             service
-                .apply(std::slice::from_ref(&config), None)
+                .apply(std::slice::from_ref(&config), ListenerProxy::Active)
                 .await
                 .unwrap();
             let server =

@@ -53,6 +53,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 shadowsocks = { version = "1", default-features = false, features = [
     "aead-cipher",
     "aead-cipher-2022",
+    "security-replay-attack-detect",
 ] }
 quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "bloom", "platform-verifier"] }
 quinn-proto = { version = "0.11.17", default-features = false }

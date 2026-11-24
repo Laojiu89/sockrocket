@@ -133,7 +133,7 @@ pub fn validate_listeners(listeners: &[ListenerConfig], reserved_ports: &[u16]) 
     Ok(())
 }
 
-fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
+pub fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
     a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
 }
 
@@ -149,6 +149,22 @@ pub fn listeners_from_yaml(map: &serde_yaml::Mapping) -> Result<Vec<ListenerConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_loader_reserves_explicit_router_ports() {
+        use super::super::model::AppConfig;
+
+        let mut raw = serde_yaml::to_value(AppConfig::default()).unwrap();
+        raw["listeners"] =
+            serde_yaml::from_str("[{name: local, type: http, port: 5300, exit: direct}]").unwrap();
+        assert!(AppConfig::from_yaml_value(raw.clone()).is_ok());
+        for key in ["dns_port", "api_port"] {
+            let mut doc = raw.clone();
+            doc[key] = 5300u16.into();
+            let error = AppConfig::from_yaml_value(doc).unwrap_err();
+            assert!(error.to_string().contains("5300"), "{error}");
+        }
+    }
 
     #[test]
     fn lan_listener_credentials_are_optional_except_for_shadowsocks() {

@@ -71,9 +71,11 @@ pub(super) fn mutate(post: &J, delete: bool) -> J {
         }
         let test_address = entry.address();
         let probe = entry.enabled
-            && !entries
-                .iter()
-                .any(|old| running && old.enabled && old.address() == test_address);
+            && !entries.iter().any(|old| {
+                running
+                    && old.enabled
+                    && sockrocket_core::config::listeners::overlaps(old.address(), test_address)
+            });
         if let Some(index) = position {
             entries[index] = entry;
         } else {

@@ -467,11 +467,15 @@ impl SwappableOutbound {
         self.inner.read().unwrap().outbound.clone()
     }
 
-    pub(super) fn with_dns_policy(&self, outbound: SharedOutbound) -> SharedOutbound {
-        SharedOutbound(Arc::new(PolicyOutbound {
-            inner: outbound,
-            resolver: self.inner.read().unwrap().resolver.clone(),
-        }))
+    pub(super) fn listener_snapshot(
+        &self,
+        select: impl FnOnce(&SharedOutbound) -> Option<SharedOutbound>,
+    ) -> Option<SharedOutbound> {
+        let state = self.inner.read().unwrap();
+        Some(SharedOutbound(Arc::new(PolicyOutbound {
+            inner: select(&state.outbound)?,
+            resolver: state.resolver.clone(),
+        })))
     }
 }
 

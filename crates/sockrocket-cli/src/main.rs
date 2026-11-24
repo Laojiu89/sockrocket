@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use sockrocket_core::config::listeners::ListenerExit;
-use sockrocket_core::proxy::listeners::ListenerService;
+use sockrocket_core::proxy::listeners::{ListenerProxy, ListenerService};
 use sockrocket_core::{
     AppConfig, ConfigWatchEvent, ConfigWatcher, DnsResolver, HealthCheckSetup, HealthEvent,
     OutboundFactory, ProxyMode, ProxyProtocol, ProxyService, Router, RoutingOutbound,
@@ -436,7 +436,7 @@ async fn async_main() -> Result<()> {
         service.stats().clone(),
         fakeip_pool.clone(),
     );
-    let initial_proxy = listener_proxy(&config, active_index, &outbound);
+    let initial_proxy = listener_proxy(&config, active_index);
     let inbound_start = listeners.apply(&config.listeners, initial_proxy).await;
 
     // Proxy-server hostnames, shared with the DNS resolver so node servers
@@ -870,6 +870,11 @@ async fn async_main() -> Result<()> {
                                     new_config.ipv6_mode,
                                     &config_path,
                                 );
+                                let proxy = listener_proxy(&new_config, new_index);
+                                if let Err(error) = listeners.apply(&new_config.listeners, proxy).await {
+                                    tracing::error!("入站监听更新失败：{error:#}");
+                                    continue;
+                                }
                                 if let Err(error) = sockrocket_core::dns::configure_bootstrap(
                                     &settings,
                                     new_config.nodes.iter().map(|node| node.server.clone()),
@@ -877,11 +882,6 @@ async fn async_main() -> Result<()> {
                                     tracing::error!(
                                         "DNS config reload skipped, keeping previous config: {error:#}"
                                     );
-                                    continue;
-                                }
-                                let proxy = listener_proxy(&new_config, new_index, &new_outbound);
-                                if let Err(error) = listeners.apply(&new_config.listeners, proxy).await {
-                                    tracing::error!("入站监听更新失败，保留当前监听：{error:#}");
                                     continue;
                                 }
                                 let answers = dns_config.dual_stack_fakeip;
@@ -1448,34 +1448,22 @@ fn build_outbound(
     Ok(wrap_with_rules(base_outbound, router, config))
 }
 
-fn listener_proxy(
-    config: &AppConfig,
-    index: Option<usize>,
-    main_outbound: &SharedOutbound,
-) -> Option<SharedOutbound> {
-    if !config
-        .listeners
-        .iter()
-        .any(|entry| entry.enabled && entry.exit == ListenerExit::Proxy)
-    {
-        return None;
+fn listener_proxy(config: &AppConfig, index: Option<usize>) -> ListenerProxy {
+    if config.proxy_mode != ProxyMode::Direct {
+        return ListenerProxy::Active;
     }
-    let node = index.and_then(|index| config.nodes.get(index))?;
-    let outbound = if config.proxy_mode == ProxyMode::Direct {
-        match sockrocket_core::create_outbound_unwarmed(node) {
-            Ok(outbound) => outbound,
-            Err(error) => {
-                tracing::warn!("入站代理出口不可用：{error:#}");
-                return None;
-            }
-        }
-    } else {
-        main_outbound
-            .0
-            .default_proxy()
-            .unwrap_or_else(|| main_outbound.clone())
-    };
-    (!outbound.0.is_direct()).then_some(outbound)
+    let node = index.and_then(|i| config.nodes.get(i)).filter(|_| {
+        config
+            .listeners
+            .iter()
+            .any(|entry| entry.enabled && entry.exit == ListenerExit::Proxy)
+    });
+    ListenerProxy::Fixed(node.and_then(|node| {
+        sockrocket_core::create_outbound_unwarmed(node)
+            .inspect_err(|error| tracing::warn!("入站代理出口不可用：{error:#}"))
+            .ok()
+            .filter(|outbound| !outbound.0.is_direct())
+    }))
 }
 
 /// Router for the configured [`ProxyMode`].
