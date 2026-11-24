@@ -76,7 +76,7 @@ impl Socks5Server {
                         let _slot = slot;
                         let result = super::routing::with_client_source(
                             Some(peer.ip()),
-                            crate::traffic::with_traffic_scope(handle_socks5(stream, outbound, stats, pool)),
+                            crate::traffic::with_traffic_scope(handle_socks5(stream, outbound, stats, pool, None)),
                         ).await;
                         if let Err(e) = result {
                             tracing::debug!("SOCKS5 connection from {} error: {}", peer, e);
@@ -142,11 +142,12 @@ fn socks5_reply(rep: u8) -> [u8; 10] {
 }
 
 /// Handle a single SOCKS5 connection.
-async fn handle_socks5(
+pub(super) async fn handle_socks5(
     mut stream: TcpStream,
     outbound: SharedOutbound,
     stats: ProxyStats,
     fakeip: Option<Arc<FakeIpPool>>,
+    auth: Option<&super::listeners::ListenerAuth>,
 ) -> Result<()> {
     let (cmd, host, port) = tokio::time::timeout(super::PROXY_HANDSHAKE_TIMEOUT, async {
         // --- Auth Negotiation ---
@@ -158,14 +159,20 @@ async fn handle_socks5(
         let mut methods = vec![0u8; nmethods as usize];
         stream.read_exact(&mut methods).await?;
 
-        // We accept NO AUTHENTICATION (0x00)
-        if !methods.contains(&0x00) {
-            // Reply: no acceptable methods
+        let method = if auth.is_some() { 0x02 } else { 0x00 };
+        if !methods.contains(&method) {
             stream.write_all(&[0x05, 0xFF]).await?;
-            bail!("Client does not support NO AUTH method");
+            bail!("Client does not support the listener's authentication method");
         }
-        // Reply: chose NO AUTH
-        stream.write_all(&[0x05, 0x00]).await?;
+        stream.write_all(&[0x05, method]).await?;
+        if let Some(auth) = auth {
+            let version = stream.read_u8().await?;
+            let username = read_auth_field(&mut stream).await?;
+            let password = read_auth_field(&mut stream).await?;
+            let accepted = version == 1 && auth.verify_socks(&username, &password);
+            stream.write_all(&[1, u8::from(!accepted)]).await?;
+            anyhow::ensure!(accepted, "SOCKS5 authentication failed");
+        }
 
         // --- Request ---
         let ver = stream.read_u8().await?;
@@ -242,6 +249,13 @@ async fn handle_socks5(
     }
 
     Ok(())
+}
+
+async fn read_auth_field(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let len = stream.read_u8().await?;
+    let mut field = vec![0; usize::from(len)];
+    stream.read_exact(&mut field).await?;
+    Ok(field)
 }
 
 #[cfg(test)]

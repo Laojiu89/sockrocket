@@ -113,6 +113,9 @@
 #sockrocket-plugin .form-grid {display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px}
 #sockrocket-plugin .fg {display:flex;flex-direction:column;gap:5px;min-width:0}
 #sockrocket-plugin .fg label {font-size:12px;color:var(--text-muted)}
+#sockrocket-plugin .inbound-password-controls {display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+#sockrocket-plugin .inbound-password-controls input {flex:1 1 10rem;min-width:0}
+#sockrocket-plugin .inbound-service-note {margin:8px 0}
 #sockrocket-plugin :is(input[type=text],input[type=password],input[type=url],input[type=number],input[type=search],select,textarea) {min-width:0;width:100%;border:1px solid var(--border);border-radius:7px;background:white;padding:9px 11px;min-height:38px}
 #sockrocket-plugin input[type=checkbox] {accent-color:var(--accent)}
 #sockrocket-plugin textarea {font:12px/1.7 var(--mono);resize:vertical;min-height:150px}
@@ -427,6 +430,41 @@ body.bg {min-width:0!important}
       <!-- ── Page: Nodes ───────────────────────────────────────────── -->
       <div class="page" id="sr-page-nodes" role="tabpanel" aria-labelledby="sr-nav-nodes">
         <div class="page-title">节点</div><p class="page-intro">查看详情不会切换节点；只有“使用”才会改变连接。测速不会切换当前节点。</p>
+        <section class="card" aria-labelledby="sr-inbound-heading">
+          <h3 id="sr-inbound-heading">入站监听</h3>
+          <p class="hint">客户端连接到这里添加的地址和端口。每个入站可单独选择直连或使用当前代理节点。</p>
+          <div class="toolbar">
+            <button type="button" class="btn btn-sm btn-accent" id="sr-inbound-add" onclick="editInbound(-1)" disabled>添加入站</button>
+            <button type="button" class="btn btn-sm" id="sr-inbound-refresh" onclick="loadInbounds()">刷新</button>
+          </div>
+          <p id="sr-inbound-service-note" class="hint inbound-service-note" role="status" hidden>Sockrocket 服务已停止，启用的入站将在服务启动后监听。</p>
+          <div id="sr-inbound-list" class="hint" role="status">正在读取入站配置…</div>
+          <form id="sr-inbound-form" hidden onsubmit="saveInbound(event)">
+            <h4 id="sr-inbound-form-title">添加入站</h4>
+            <div class="form-grid">
+              <div class="fg"><label for="sr-inbound-name">名称</label><input id="sr-inbound-name" type="text" required maxlength="96" placeholder="例如：家庭代理"></div>
+              <div class="fg"><label for="sr-inbound-protocol">入站协议</label><select id="sr-inbound-protocol" onchange="updateInboundProtocol()"><option value="mixed">Mixed（HTTP + SOCKS5）</option><option value="http">HTTP</option><option value="socks">SOCKS5</option><option value="shadowsocks">Shadowsocks（TCP）</option></select></div>
+              <div class="fg"><label for="sr-inbound-listen">监听 IP</label><input id="sr-inbound-listen" type="text" placeholder="例如：192.168.50.1" required spellcheck="false" aria-describedby="sr-inbound-listen-hint" oninput="updateInboundListenHint()"><span class="hint" id="sr-inbound-listen-hint"></span></div>
+              <div class="fg"><label for="sr-inbound-port">监听端口</label><input id="sr-inbound-port" type="number" min="1" max="65535" step="1" required></div>
+              <div class="fg"><label for="sr-inbound-exit">出口</label><select id="sr-inbound-exit"><option value="direct">直连</option><option value="proxy">代理 · 当前节点</option></select></div>
+              <div class="fg"><label for="sr-inbound-enabled">状态</label><select id="sr-inbound-enabled"><option value="true">启用</option><option value="false">停用</option></select></div>
+              <div class="fg" id="sr-inbound-user-field"><label for="sr-inbound-user">用户名</label><input id="sr-inbound-user" type="text" autocomplete="off" maxlength="255" oninput="updateInboundProtocol()"><span class="hint">用户名和密码可同时留空。启用认证时请同时填写。</span></div>
+              <div class="fg" id="sr-inbound-cipher-field" hidden><label for="sr-inbound-cipher">加密方式</label><select id="sr-inbound-cipher"><option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305</option><option value="aes-128-gcm">aes-128-gcm</option><option value="aes-256-gcm">aes-256-gcm</option></select></div>
+              <div class="fg">
+                <label for="sr-inbound-password">密码</label>
+                <div class="inbound-password-controls">
+                  <input id="sr-inbound-password" type="password" autocomplete="new-password" maxlength="255" aria-describedby="sr-inbound-password-hint" oninput="updateInboundPasswordReveal()">
+                  <button type="button" class="btn btn-sm" id="sr-inbound-password-reveal" aria-controls="sr-inbound-password" onclick="toggleInboundPasswordReveal()" disabled>显示本次输入</button>
+                </div>
+                <span class="hint" id="sr-inbound-password-hint"></span>
+              </div>
+            </div>
+            <div class="toolbar">
+              <button type="submit" class="btn btn-accent" id="sr-inbound-save">保存入站</button>
+              <button type="button" class="btn" id="sr-inbound-cancel" onclick="closeInboundEditor()">取消</button>
+            </div>
+          </form>
+        </section>
         <section class="card"><h3>节点分组</h3><p class="hint">为不同规则选择独立出口。分组内选择节点不会改变全局节点；节点更名后仍保留成员关系。失效成员不会自动改走其他线路。</p><div class="toolbar"><button class="btn btn-sm" onclick="editProxyGroup(-1)">新建分组</button><button class="btn btn-sm" onclick="loadProxyGroups()">刷新分组</button></div><div id="sr-proxy-group-list" style="margin-top:12px"></div>
         <div id="sr-proxy-group-editor" hidden><h4>编辑节点分组</h4><div class="form-grid proxy-group-grid"><div class="fg"><label for="sr-pg-name">名称（必填）</label><input id="sr-pg-name" type="text" maxlength="96" placeholder="例如：视频线路"></div><div class="fg"><label for="sr-pg-type">选择方式</label><select id="sr-pg-type" onchange="updateProxyGroupMode()"><option value="select">手动选择</option><option value="fallback">TCP 建连失败时按成员顺序尝试</option><option value="url-test">按连接延迟自动选择</option></select></div><div class="fg"><label id="sr-pg-members-label">组内成员</label><div id="sr-pg-members" class="pg-member-list" role="group" aria-labelledby="sr-pg-members-label"></div><span class="hint" id="sr-pg-member-hint">可勾选多个成员，再选择当前使用的节点。保存后生效。</span><div class="toolbar" id="sr-pg-member-tools"><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(true)">全选</button><button type="button" class="btn btn-sm" onclick="setProxyGroupMembers(false)">清空</button></div></div><div class="fg" id="sr-pg-current-field"><label for="sr-pg-current">当前使用节点</label><select id="sr-pg-current" onchange="pickProxyGroupMember(this.value)"></select><span class="hint">从已勾选成员中选择一个出口，保存后生效；不会自动切换。</span></div></div><div class="toolbar"><button class="btn btn-accent" id="sr-pg-save" onclick="saveProxyGroup()">保存分组</button><button class="btn" onclick="srElement('proxy-group-editor').hidden=true">取消</button></div></div></section>
         <div class="toolbar">
@@ -1198,13 +1236,191 @@ function srShowPage(p) {
   if (p === 'nodes') renderNodes();
   if (!SR_PAGE_LOADED[p]) {
     SR_PAGE_LOADED[p] = true;
-    if (p === 'nodes') { srLoadNodes(); loadProxyGroups(); }
+    if (p === 'nodes') { srLoadNodes(); loadProxyGroups(); loadInbounds(); }
     if (p === 'subs') srLoadSubs();
     if (p === 'dns') { srLoadRules(); ruleTypeChanged(); }
     if (p === 'config') srLoadConfig();
     if (p === 'network' && !dnsPolicyDirty) loadNetworkPolicy();
     if (p === 'logs') loadLog();
   }
+}
+
+var inboundRows = [], inboundRevision = '', inboundBusy = false, inboundOriginal = null;
+var inboundNames = {http:'HTTP', socks:'SOCKS5', mixed:'Mixed', shadowsocks:'Shadowsocks（TCP）'};
+
+function setInboundBusy(busy) {
+  inboundBusy = busy;
+  ['refresh','save','cancel'].forEach(function (id) {
+    srElement('inbound-' + id).disabled = busy;
+  });
+  srElement('inbound-add').disabled = busy || !inboundRevision;
+  srElement('inbound-list').querySelectorAll('button').forEach(function (button) { button.disabled = busy; });
+  updateInboundPasswordReveal();
+}
+
+function inboundEnabledStatus(running) {
+  return running === true ? '已启用' : running === false ? '待启动' : '状态待确认';
+}
+
+function updateInboundStatus(running) {
+  var note = srElement('inbound-service-note');
+  note.hidden = !inboundRevision || running !== false || !inboundRows.some(function (row) { return row.enabled; });
+  if (!inboundRevision) return;
+  var status = inboundEnabledStatus(running);
+  srElement('inbound-list').querySelectorAll('[data-inbound-enabled]').forEach(function (item) {
+    if (item.textContent !== status) item.textContent = status;
+  });
+}
+
+function loadInbounds() {
+  if (inboundBusy) return;
+  setInboundBusy(true);
+  srApi('listeners', null, function (data) {
+    var list = srElement('inbound-list');
+    if (data.ok !== true) {
+      list.textContent = data.msg || '入站配置读取失败。';
+      inboundRevision = '';
+    } else {
+      var revisionChanged = inboundRevision && inboundRevision !== data.revision;
+      if (revisionChanged && !srElement('inbound-form').hidden) {
+        srShowMsg('入站配置已变化。请核对当前列表后重新打开编辑表单。', 'err');
+        closeInboundEditor();
+      }
+      inboundRevision = data.revision;
+      inboundRows = data.listeners;
+      list.innerHTML = inboundRows.map(function (row, index) {
+        var host = row.listen.indexOf(':') >= 0 ? '[' + row.listen + ']' : row.listen;
+        var description = inboundNames[row.type] + ' · ' + host + ':' + row.port + ' · '
+          + (row.exit === 'proxy' ? '代理 · 当前节点' : '直连');
+        var status = row.enabled ? '<span data-inbound-enabled>' + inboundEnabledStatus(data.running) + '</span>' : '已停用';
+        var auth = (row.has_password ? '密码已保存' : '免认证')
+          + (inboundLoopback(row.listen) ? ' · 仅路由器本机' : '');
+        return '<div class="row"><span class="r-name">' + srEsc(row.name)
+          + '<span class="r-sub">' + srEsc(description) + ' · ' + status + ' · ' + auth + '</span></span><span>'
+          + '<button class="btn btn-sm" type="button" onclick="editInbound(' + index + ')">编辑</button> '
+          + '<button class="btn btn-sm" type="button" onclick="deleteInbound(' + index + ')">删除</button></span></div>';
+      }).join('') || '暂无入站监听。';
+    }
+    updateInboundStatus(data.running);
+    setInboundBusy(false);
+  }, function () {
+    srElement('inbound-list').textContent = '入站配置读取失败，请刷新。';
+    inboundRevision = '';
+    updateInboundStatus(null);
+    setInboundBusy(false);
+  });
+}
+
+function editInbound(index) {
+  if (inboundBusy || !inboundRevision) return;
+  inboundOriginal = inboundRows[index] || null;
+  var row = inboundOriginal || {name:'', type:'mixed', listen:'', port:'', exit:'direct', enabled:true, username:'', cipher:''};
+  srElement('inbound-form-title').textContent = inboundOriginal ? '编辑入站' : '添加入站';
+  srElement('inbound-name').value = row.name;
+  srElement('inbound-protocol').value = row.type;
+  srElement('inbound-listen').value = row.listen;
+  srElement('inbound-port').value = row.port;
+  srElement('inbound-exit').value = row.exit;
+  srElement('inbound-enabled').value = String(row.enabled);
+  srElement('inbound-user').value = row.username;
+  srElement('inbound-cipher').value = row.cipher || 'chacha20-ietf-poly1305';
+  resetInboundPassword();
+  srElement('inbound-form').hidden = false;
+  updateInboundListenHint();
+  updateInboundProtocol();
+  srElement('inbound-name').focus();
+}
+
+function closeInboundEditor() {
+  resetInboundPassword();
+  srElement('inbound-form').hidden = true;
+  inboundOriginal = null;
+}
+
+function inboundLoopback(address) {
+  return address === '::1' || /^127\./.test(address);
+}
+
+function updateInboundListenHint() {
+  var address = srElement('inbound-listen').value.trim();
+  var hint = '填路由器的局域网 IP，可供同网段设备连接。';
+  if (inboundLoopback(address)) {
+    hint = '该地址仅供路由器本机连接，例如同一台路由器上的端口转发服务。';
+  } else if (address === '0.0.0.0' || address === '::') {
+    hint = '这是 ' + (address === '::' ? 'IPv6' : 'IPv4') + ' 通配地址。实际可达范围取决于路由器防火墙。';
+  }
+  srElement('inbound-listen-hint').textContent = hint;
+}
+
+function resetInboundPassword() {
+  var password = srElement('inbound-password');
+  password.value = '';
+  password.type = 'password';
+  updateInboundPasswordReveal();
+}
+
+function updateInboundPasswordReveal() {
+  var password = srElement('inbound-password');
+  var reveal = srElement('inbound-password-reveal');
+  if (inboundBusy || !password.value) password.type = 'password';
+  reveal.disabled = inboundBusy || !password.value;
+  reveal.textContent = password.type === 'text' ? '隐藏本次输入' : '显示本次输入';
+}
+
+function toggleInboundPasswordReveal() {
+  if (srElement('inbound-password-reveal').disabled) return;
+  var password = srElement('inbound-password');
+  password.type = password.type === 'text' ? 'password' : 'text';
+  updateInboundPasswordReveal();
+}
+
+function updateInboundProtocol() {
+  var encrypted = srElement('inbound-protocol').value === 'shadowsocks';
+  var username = srElement('inbound-user').value;
+  var retained = inboundOriginal && inboundOriginal.has_password
+    && encrypted === (inboundOriginal.type === 'shadowsocks') && (encrypted || !!username);
+  var password = srElement('inbound-password');
+  srElement('inbound-user-field').hidden = encrypted;
+  srElement('inbound-cipher-field').hidden = !encrypted;
+  password.required = (encrypted || !!username) && !retained;
+  password.placeholder = retained ? '已保存，留空保留' : '输入密码';
+  srElement('inbound-password-hint').textContent = retained
+    ? '密码已保存。留空保留原密码，填写新密码可更换。'
+    : (encrypted ? '客户端连接时使用此密码。' : '');
+}
+
+function saveInbound(event) {
+  event.preventDefault();
+  if (inboundBusy || !inboundRevision) return;
+  var protocol = srElement('inbound-protocol').value;
+  var encrypted = protocol === 'shadowsocks';
+  var listener = {
+    name: srElement('inbound-name').value.trim(), type: protocol,
+    listen: srElement('inbound-listen').value.trim(), port: Number(srElement('inbound-port').value),
+    exit: srElement('inbound-exit').value, enabled: srElement('inbound-enabled').value === 'true',
+    username: encrypted ? '' : srElement('inbound-user').value,
+    password: srElement('inbound-password').value,
+    cipher: encrypted ? srElement('inbound-cipher').value : ''
+  };
+  mutateInbound('save_listener', {listener:listener, original_name:inboundOriginal ? inboundOriginal.name : ''});
+}
+
+function deleteInbound(index) {
+  var row = inboundRows[index];
+  if (inboundBusy || !inboundRevision || !row || !confirm('删除入站「' + row.name + '」？')) return;
+  mutateInbound('delete_listener', {original_name:row.name});
+}
+
+function mutateInbound(action, body) {
+  body.revision = inboundRevision;
+  setInboundBusy(true);
+  srApi(action, body, function (data) {
+    setInboundBusy(false);
+    if (data.ok !== true) { srShowMsg(data.msg || '入站保存失败。', 'err'); return; }
+    closeInboundEditor();
+    srShowMsg(data.msg, 'ok');
+    loadInbounds();
+  }, function () { setInboundBusy(false); });
 }
 
 /* Structured DNS policy; stale reads never overwrite an edited form. */
@@ -1375,6 +1591,7 @@ function renderSubscriptionTraffic(traffic) {
 function renderChrome() {
   var st = SR_STATE.status, uptime = SR_STATE.uptime, si = SR_STATE.sysinfo || {};
   var running = !!st.running;
+  updateInboundStatus(SR_STATE.statusKnown ? running : null);
   var pill = srElement('service-pill');
   pill.textContent = !SR_STATE.statusKnown ? '状态未知' : running ? '运行中' : '已停止';
   pill.className = 'service-pill' + (SR_STATE.statusKnown && running ? ' success' : '');

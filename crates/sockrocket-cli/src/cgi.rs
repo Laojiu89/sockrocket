@@ -18,6 +18,7 @@
 
 mod devices;
 mod http;
+mod listeners;
 mod network_settings;
 mod proxy_groups;
 mod route_trace;
@@ -427,6 +428,7 @@ fn load_conf() -> Result<Mapping> {
 
 fn save_conf(map: &Mapping) -> Result<()> {
     devices::paused_sources(map)?;
+    listeners::validate(map)?;
     let groups = sockrocket_core::config::model::proxy_groups_from_yaml(map)
         .map_err(|_| anyhow::anyhow!("Invalid proxy groups"))?;
     let rules = load_routing_rules(map);
@@ -544,6 +546,7 @@ fn read_only_action(action: &str) -> bool {
             | "fetch_rule_list"
             | "trace_route"
             | "proxy_groups"
+            | "listeners"
             | "network_settings"
             | "dns_test"
             | "export_rules"
@@ -618,6 +621,9 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "del_direct_domain" => act_del_direct_domain(post),
         "set_direct_server" => act_set_direct_server(post),
         "proxy_groups" => proxy_groups::get(),
+        "listeners" => listeners::list(),
+        "save_listener" => listeners::mutate(post, false),
+        "delete_listener" => listeners::mutate(post, true),
         "save_proxy_group" => proxy_groups::save(post),
         "delete_proxy_group" => proxy_groups::delete(post),
         "save_device_binding" => devices::save_binding(post),
@@ -915,6 +921,9 @@ fn act_save_config(post: &J) -> J {
 fn validate_advanced_config(text: &str) -> Result<()> {
     let raw = parse_yaml_document(text)?;
     let map = raw.as_mapping();
+    if let Some(map) = map {
+        listeners::validate(map)?;
+    }
     let ipset_direct = map.is_some_and(|map| conf_bool(map, "cn_ipset_direct", false));
     let transparent = map.is_none_or(|map| effective_toggles(map).0);
     let dns = sockrocket_core::config::dns::DnsSettings::from_yaml(&raw);
@@ -4425,6 +4434,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn listener_editor_round_trips_without_disclosing_password() {
+        let _env = TestEnv::new(SAMPLE);
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let revision = dispatch("listeners", &json!({}))["revision"].clone();
+        let mut row = json!({
+            "name":"living-room", "type":"mixed", "listen":"127.0.0.1", "port":port,
+            "exit":"direct", "username":"lan", "password":"private-credential",
+        });
+        let add = json!({"revision":revision, "listener":row});
+        assert_eq!(dispatch("save_listener", &add)["ok"], true);
+        assert_eq!(dispatch("save_listener", &add)["ok"], false);
+        let list = dispatch("listeners", &json!({}));
+        assert!(!list.to_string().contains("private-credential"));
+        assert_eq!(list["listeners"][0]["has_password"], true);
+
+        row["exit"] = json!("proxy");
+        row["password"] = json!("");
+        assert_eq!(
+            dispatch(
+                "save_listener",
+                &json!({
+                    "revision":list["revision"], "original_name":"living-room", "listener":row,
+                })
+            )["ok"],
+            true
+        );
+        let map = load_conf().unwrap();
+        let saved = sockrocket_core::config::listeners::listeners_from_yaml(&map).unwrap();
+        assert_eq!(
+            saved[0].exit,
+            sockrocket_core::config::listeners::ListenerExit::Proxy
+        );
+        assert_eq!(saved[0].password, "private-credential");
+        let revision = dispatch("listeners", &json!({}))["revision"].clone();
+        assert_eq!(
+            dispatch(
+                "delete_listener",
+                &json!({
+                    "revision":revision, "original_name":"living-room",
+                })
+            )["ok"],
+            true
+        );
+        assert_eq!(dispatch("listeners", &json!({}))["listeners"], json!([]));
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod dedup;
 pub mod dns;
 pub mod export;
 pub mod group;
+pub mod listeners;
 pub mod model;
 pub mod node_identity;
 pub mod rule_groups;

@@ -63,7 +63,7 @@ impl HttpProxyServer {
                     let stats = self.stats.clone();
                     connections.spawn(async move {
                         let _slot = slot;
-                        let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(handle_http(stream, outbound, stats.clone()))).await;
+                        let result = super::routing::with_client_source(Some(peer.ip()), crate::traffic::with_traffic_scope(handle_http(stream, outbound, stats, None))).await;
                         if let Err(e) = result {
                             tracing::debug!("HTTP proxy connection from {} error: {}", peer, e);
                         }
@@ -168,10 +168,11 @@ fn parse_request_line(header: &[u8]) -> Result<(String, String, String)> {
 }
 
 /// Handle a single HTTP proxy connection.
-async fn handle_http(
+pub(super) async fn handle_http(
     mut stream: TcpStream,
     outbound: SharedOutbound,
     stats: ProxyStats,
+    auth: Option<&super::listeners::ListenerAuth>,
 ) -> Result<()> {
     let (header, remaining) = tokio::time::timeout(
         super::PROXY_HANDSHAKE_TIMEOUT,
@@ -179,6 +180,10 @@ async fn handle_http(
     )
     .await
     .map_err(|_| anyhow::anyhow!("HTTP proxy handshake timed out"))??;
+    if auth.is_some_and(|auth| !auth.verify_http(&header)) {
+        stream.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Sockrocket\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        return Ok(());
+    }
     let (method, target, _version) = parse_request_line(&header)?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
@@ -218,7 +223,7 @@ async fn handle_http(
         }
     } else {
         // Plain HTTP proxy (GET, POST, etc.)
-        super::http_forward::serve(stream, &header, &remaining, outbound, stats).await?;
+        super::http_forward::serve(stream, &header, &remaining, outbound, stats, auth).await?;
     }
 
     Ok(())

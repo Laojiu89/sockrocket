@@ -89,6 +89,8 @@ pub struct AppConfig {
     pub socks_port: u16,
     /// Local HTTP proxy port
     pub http_port: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listeners: Vec<super::listeners::ListenerConfig>,
     /// Shared DNS policy. None preserves legacy router keys and defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<super::dns::DnsSettings>,
@@ -144,6 +146,7 @@ impl Default for AppConfig {
             listen_addr: "127.0.0.1".to_string(),
             socks_port: 1080,
             http_port: 1087,
+            listeners: Vec::new(),
             dns: None,
             ipv6_mode: super::dns::Ipv6Mode::default(),
             proxy_mode: ProxyMode::default(),
@@ -219,6 +222,8 @@ impl AppConfig {
         super::group::validate_targets(&cfg.groups, &cfg.rules)
             .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         validate_device_rule_groups(&cfg.device_rule_groups, &cfg.rules, &cfg.groups)
+            .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
+        super::listeners::validate_listeners(&cfg.listeners, &[cfg.socks_port, cfg.http_port])
             .map_err(<serde_yaml::Error as serde::de::Error>::custom)?;
         Ok(cfg)
     }

@@ -466,6 +466,13 @@ impl SwappableOutbound {
     pub fn current(&self) -> SharedOutbound {
         self.inner.read().unwrap().outbound.clone()
     }
+
+    pub(super) fn with_dns_policy(&self, outbound: SharedOutbound) -> SharedOutbound {
+        SharedOutbound(Arc::new(PolicyOutbound {
+            inner: outbound,
+            resolver: self.inner.read().unwrap().resolver.clone(),
+        }))
+    }
 }
 
 impl Outbound for SwappableOutbound {
