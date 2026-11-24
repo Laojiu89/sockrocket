@@ -67,6 +67,7 @@ http-body-util = "0.1"
 sysproxy = { workspace = true }
 tun = { workspace = true }
 ipnet = { version = "2", features = ["serde"] }
+zstd = { version = "0.12", default-features = false }
 ipstack = { workspace = true }
 etherparse = { workspace = true }
 

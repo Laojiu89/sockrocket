@@ -1,4 +1,6 @@
 //! Read-only downloads for importing a public rule list into one selected group.
+mod mrs;
+
 use std::{net::SocketAddr, time::Duration};
 
 use anyhow::{Context, Result, ensure};
@@ -14,6 +16,7 @@ pub const RULE_LIST_TIMEOUT_SECS: u64 = 30;
 pub struct RuleListPreview {
     pub text: String,
     pub count: usize,
+    pub packed_domains: usize,
     pub skipped: std::collections::BTreeMap<&'static str, usize>,
 }
 
@@ -100,6 +103,7 @@ pub fn preview_rule_list(text: &str, target: &str, group: &str) -> Result<RuleLi
     Ok(RuleListPreview {
         text,
         count: parsed.rules.len(),
+        packed_domains: 0,
         skipped,
     })
 }
@@ -122,8 +126,20 @@ pub async fn fetch_rule_list(
     })
     .await
     .context("读取规则超时，请稍后重试")??;
-    let text = String::from_utf8(bytes).context("规则列表须为 UTF-8 文本")?;
-    preview_rule_list(&text, target, group)
+    preview_rule_list_bytes(&bytes, target, group)
+}
+
+/// Preview an already downloaded MRS or text list using the same limits as URL imports.
+pub fn preview_rule_list_bytes(bytes: &[u8], target: &str, group: &str) -> Result<RuleListPreview> {
+    ensure!(
+        bytes.len() <= MAX_RULE_LIST_BYTES,
+        "规则列表超过 2 MiB 限制"
+    );
+    if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        return mrs::preview(bytes, target, group).context("无法读取 MRS 规则集");
+    }
+    let text = std::str::from_utf8(bytes).context("规则列表须为 UTF-8 文本或 Mihomo MRS 规则集")?;
+    preview_rule_list(text, target, group)
 }
 
 async fn download(url: &str, socks: Option<SocketAddr>) -> Result<Vec<u8>> {
@@ -145,7 +161,7 @@ async fn download(url: &str, socks: Option<SocketAddr>) -> Result<Vec<u8>> {
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .is_some_and(|s| s.to_ascii_lowercase().contains("text/html"));
-    ensure!(!html, "链接返回的是网页，请使用原始规则文本链接");
+    ensure!(!html, "链接返回的是网页，请使用规则文件直链");
     ensure!(
         response
             .content_length()

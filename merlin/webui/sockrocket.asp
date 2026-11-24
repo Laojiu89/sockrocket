@@ -659,14 +659,14 @@ body.bg {min-width:0!important}
             <div id="sr-rule-import-panel" hidden>
               <div class="fg"><label for="sr-rule-import-url">规则列表链接</label><input type="url" id="sr-rule-import-url" maxlength="4096" autocomplete="off" spellcheck="false" placeholder="https://example.com/rules.list"></div>
               <div class="toolbar" style="margin-top:8px"><button type="button" class="btn btn-accent" id="sr-rule-import-fetch" onclick="fetchRuleList()">读取并预览</button><span class="hint" id="sr-rule-import-state" role="status" aria-live="polite"></span></div>
-              <p class="hint">读取后可修改并预览，再追加到当前组。未指定出口的规则使用下方所选出口；注释和空行忽略，重复规则跳过。仅导入本次内容，不自动更新。</p>
+              <p class="hint">支持文本列表和 Mihomo MRS（域名、IP 网段）直链。读取后可修改并预览，再追加到当前组。未指定出口的规则使用下方所选出口；注释和空行忽略，重复规则跳过。仅导入本次内容，不自动更新。</p>
             </div>
           <div class="form-grid adaptive-form" id="sr-rule-default-fields">
             <div class="fg"><label for="sr-rule-type">类型</label>
               <select id="sr-rule-type" onchange="ruleTypeChanged()">
                 <option value="domain-suffix">域名后缀</option>
                 <option value="domain">完整域名</option>
-                <option value="domain-keyword">域名关键词</option>
+                <option value="domain-keyword">域名关键词</option><option value="domain-set">域名集合</option>
                 <option value="ip-cidr">IP 网段</option>
                 <option value="geoip">地区</option>
                 <option value="dst-port">端口</option>
@@ -706,7 +706,7 @@ body.bg {min-width:0!important}
           </div>
           </div>
           </div>
-<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
+<section hidden class="rule-inline-editor" id="sr-rule-edit-panel" aria-labelledby="sr-rule-edit-title"><h3 id="sr-rule-edit-title">编辑规则</h3><p class="hint">可直接修改优先级，数字越大越先匹配。运行中的服务会重启以应用规则。</p><div class="form-grid"><div class="fg"><label for="sr-edit-rule-group">分组</label><input type="text" id="sr-edit-rule-group" list="sr-rule-group-list"></div><div class="fg"><label for="sr-edit-rule-type">类型</label><select id="sr-edit-rule-type" onchange="editRuleTypeChanged()"><option value="domain">完整域名</option><option value="domain-suffix">域名后缀</option><option value="domain-keyword">域名关键词</option><option value="domain-set">域名集合</option><option value="ip-cidr">IP 网段</option><option value="geoip">地区</option><option value="dst-port">端口</option></select></div><div class="fg"><label for="sr-edit-rule-pattern">匹配内容</label><input type="text" id="sr-edit-rule-pattern" spellcheck="false"></div><div class="fg"><label for="sr-edit-rule-source">设备来源 IP / 网段</label><input id="sr-edit-rule-source" type="text" placeholder="留空作为组内规则" autocomplete="off"></div><div class="fg"><label for="sr-edit-rule-priority">优先级（数字越大越先匹配）</label><input type="number" id="sr-edit-rule-priority" step="1" min="-2147483648" max="2147483647"></div><div class="fg"><label for="sr-edit-rule-target">处理方式</label><select id="sr-edit-rule-target"><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select></div></div><label><input type="checkbox" id="sr-edit-rule-enabled"> 启用此规则</label><div class="dialog-actions"><button class="btn" onclick="cancelRuleEditor()">取消</button><button class="btn btn-accent" id="sr-rule-edit-save" onclick="saveRuleEdit()">保存修改</button></div></section>
           <div id="sr-rule-list-panel">
           <input type="text" id="sr-rule-search" autocomplete="off" spellcheck="false" aria-label="搜索规则" placeholder="查找组内规则（域名、IP 或名称）" oninput="renderRules()">
           <details id="sr-rule-filter-panel"><summary>更多筛选</summary><div class="rule-filters"><select id="sr-rule-filter-target" aria-label="筛选处理方式" onchange="renderRules()"><option value="">全部处理方式</option><option value="proxy">代理</option><option value="direct">直连</option><option value="reject">拒绝</option></select><select id="sr-rule-filter-scope" aria-label="筛选规则来源" onchange="renderRules()"><option value="">全部来源</option><option value="global">全局规则</option><option value="device">设备专属规则</option></select><select id="sr-rule-filter-state" aria-label="筛选状态" onchange="renderRules()"><option value="">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></div><button class="btn btn-sm" onclick="changeRuleGroup(RULE_SELECTED_GROUP)">清除筛选</button></details><p class="hint" id="sr-rule-count" aria-live="polite"></p>
@@ -2866,12 +2866,16 @@ function saveDevicePolicy() {
 }
 
 /* ══ Routing rules ═════════════════════════════════════════════════ */
-var RULE_TYPE_LABEL = { 'domain': '完整域名', 'domain-suffix': '域名后缀', 'domain-keyword': '域名关键词', 'ip-cidr': 'IP 网段', 'geoip': '地区', 'dst-port': '端口', 'port': '端口', 'final': '最终规则', 'match': '最终规则' };
+var RULE_TYPE_LABEL = { 'domain': '完整域名', 'domain-suffix': '域名后缀', 'domain-keyword': '域名关键词', 'domain-set': '域名集合', 'ip-cidr': 'IP 网段', 'geoip': '地区', 'dst-port': '端口', 'port': '端口', 'final': '最终规则', 'match': '最终规则' };
+function rulePatternSummary(rule) {
+  return rule.rule_type === 'domain-set' ? rule.pattern.split('|').length+' 个域名' : rule.pattern;
+}
 var RULE_TARGET_LABEL = { 'direct': '直连', 'proxy': '代理', 'reject': '拒绝' };
 var RULE_PATTERN_HINT = {
   'domain': 'www.example.invalid',
   'domain-suffix': 'example.invalid',
   'domain-keyword': 'google',
+  'domain-set': 'www.example.com|+.example.org',
   'ip-cidr': '10.0.0.0/8',
   'geoip': '地区代码，例如 CN、HK、US、JP',
   'dst-port': '443 或 1000-2000',
@@ -3100,7 +3104,7 @@ function fetchRuleList() {
     editor.selectionStart = editor.selectionEnd = 0;
     editor.scrollTop = 0;
     var skipped=Object.keys(d.skipped||{}).map(function(kind){return kind+' × '+d.skipped[kind];});
-    srElement('rule-import-state').textContent='已读取 '+Number(d.count||0)+' 条待导入规则。'+(skipped.length?'已跳过不支持的类型：'+skipped.join('、')+'。':'')+'请检查预览后确认添加。';
+    srElement('rule-import-state').textContent='已读取 '+Number(d.count||0)+' 条待导入规则。'+(d.packed_domains?'域名集合共包含 '+Number(d.packed_domains)+' 个域名。':'')+(skipped.length?'已跳过不支持的类型：'+skipped.join('、')+'。':'')+'请检查预览后确认添加。';
     previewRuleChanges();
   }
   srApi('fetch_rule_list',{url:url,cache_preview:true,target:srElement('rule-target').value,group:RULE_SELECTED_GROUP},finish,finish,40000);
@@ -3650,7 +3654,7 @@ function flowTraceHtml(data) {
   var t=data.trace, row=ruleByIndex(t.matched_rule);
   var title=(t.definitive?'判定：':'待验证：')+(RULE_TARGET_LABEL[t.action]||t.action);
   var builtinMatch=t.matched_builtin && t.steps.some(function(step){return step.outcome==='matched' && step.rule_type!=='final';});
-  var reason=data.mode!=='rule' ? '当前模式跳过分流规则。' : row ? '命中配置 #'+(Number(t.matched_rule)+1)+' · '+(row.name||row.group||RULE_TYPE_LABEL[row.rule_type]||row.rule_type)+' · '+row.pattern+' · 优先级 '+Number(row.priority||0) : builtinMatch ? '命中内置国内 / 局域网分组。' : hasDeviceAssignment(data.source)?'使用设备默认出口。':'使用全局设备兜底。';
+  var reason=data.mode!=='rule' ? '当前模式跳过分流规则。' : row ? '命中配置 #'+(Number(t.matched_rule)+1)+' · '+(row.name||row.group||RULE_TYPE_LABEL[row.rule_type]||row.rule_type)+' · '+rulePatternSummary(row)+' · 优先级 '+Number(row.priority||0) : builtinMatch ? '命中内置国内 / 局域网分组。' : hasDeviceAssignment(data.source)?'使用设备默认出口。':'使用全局设备兜底。';
   var dns={literal:'目的地址为 IP',provided:'使用填写的真实目的 IP',resolved:'按需 DNS 解析成功',not_needed:'命中前无需 DNS 解析',failed:'DNS 解析失败，IP 规则尚未验证',skipped:'未查询 DNS，IP 规则尚未验证'};
   var warnings=[];
   if(!data.running)warnings.push('代理已停止：以下仅为保存配置的判定。');
@@ -3720,7 +3724,7 @@ function ruleRowHtml(r, position, ordered) {
   return '<div class="row rule-row"' + dim + '><div class="rule-main">' +
     '<span class="badge acc">' + srEsc(RULE_TYPE_LABEL[r.rule_type] || r.rule_type) + '</span> ' +
     '<span class="badge">' + srEsc(RULE_TARGET_LABEL[r.target] || r.target) + '</span>' +
-    '<div class="rule-pattern">' + srEsc(isFinalRule(r) ? '未命中的其余流量' : r.pattern) + '</div>' +
+    '<div class="rule-pattern">' + srEsc(isFinalRule(r) ? '未命中的其余流量' : rulePatternSummary(r)) + '</div>' +
     '<span class="rule-meta">' + (r.enabled === false ? '已停用' : '') + '</span></div>' +
     '<div class="rule-actions"><button class="btn btn-sm" onclick="editRule(' + Number(r.index) + ')">编辑</button>' +
     '<details><summary>更多</summary><div class="toolbar"><button class="btn btn-sm" onclick="inspectRule(' + Number(r.index) + ')">详情</button>' +
@@ -3907,7 +3911,13 @@ function previewRuleChanges() {
   rulePreviewSnapshot = ruleEditorSnapshot();
   srElement('rule-preview-title').textContent = RULE_EDIT_GROUP !== null ? '确认替换整个分组' : '确认添加规则';
   srElement('rule-preview-apply').textContent = RULE_EDIT_GROUP !== null ? '保存整组修改' : RULE_IMPORT_MODE ? '添加这 '+text.split(/\r?\n/).filter(function(line){return line.trim() && !/^\s*[#;]/.test(line);}).length+' 条规则' : '添加到「'+(RULE_SELECTED_GROUP||'未分组')+'」';
-  srElement('rule-preview-text').textContent = text || 'MATCH,' + srElement('rule-target').value.toUpperCase();
+  // The editor retains every member for inspection and submission. Keep the
+  // confirmation readable for imported sets containing thousands of domains.
+  var display = text.replace(/^DOMAIN-SET,([^,\r\n]+),([^,\r\n]+)$/gim,function(line,pattern,target) {
+    var members = pattern.split('|');
+    return '域名集合（'+members.length+' 个域名） '+members.slice(0,2).join('、')+(members.length>2?' 等':'')+' → '+target;
+  });
+  srElement('rule-preview-text').textContent = display || 'MATCH,' + srElement('rule-target').value.toUpperCase();
   srElement('rule-preview-summary').textContent = '分组：' + (srElement('rule-group').value.trim() || '未分组') + (RULE_EDIT_GROUP !== null ? '。这会替换整个分组，并将其集中到首次出现的位置；未修改规则的启用状态和优先级会保留。' : '。类型：' + (RULE_IMPORT_MODE ? '链接规则，以每行类型与出口为准' : RULE_TYPE_LABEL[srElement('rule-type').value] || '混合') + '；默认处理：' + (RULE_TARGET_LABEL[srElement('rule-target').value] || srElement('rule-target').value) + (RULE_IMPORT_MODE ? '。' : '。现有规则按所选重复处理方式保留或替换。'));
   srElement('rule-preview-summary').textContent += ' 优先级：'+(readRulePriority('rule-priority') === null ? (RULE_EDIT_GROUP !== null ? '保留原值，新规则沿用分组优先级' : '保留原值，新规则为 0') : readRulePriority('rule-priority'))+'（数字越大越先匹配）。';
   srElement('rule-preview-summary').textContent += ' 来源：'+(RULE_EDIT_GROUP !== null ? '保留每行 SOURCE 或原分组来源' : srElement('rule-source').value.trim() || (RULE_IMPORT_MODE?'由组绑定决定':'按组绑定、规则来源或兜底设置生效'))+'。';

@@ -41,6 +41,13 @@ pub fn validate_rule(rule: &RoutingRule) -> Result<(), &'static str> {
                 return Err("Invalid domain routing pattern");
             }
         }
+        "domain-set" => {
+            if crate::config::rules_batch::domain_set_members(&rule.pattern)
+                .any(|member| member.is_err())
+            {
+                return Err("Invalid domain set");
+            }
+        }
         "ip-cidr" if parse_cidr(&rule.pattern).is_some() => {}
         "geoip"
             if rule.pattern.eq_ignore_ascii_case("PRIVATE")
@@ -104,6 +111,8 @@ pub enum MatchRule {
     Domain(String),
     /// Domain suffix match: ".example.com" matches "foo.example.com"
     DomainSuffix(String),
+    /// Exact names and suffixes grouped under a single action.
+    DomainSet(Arc<DomainSet>),
     /// Domain keyword match: contains "google"
     DomainKeyword(String),
     /// IPv4/IPv6 CIDR match
@@ -116,6 +125,56 @@ pub enum MatchRule {
     MatchAll,
     /// TUN DNS mapping already identified this destination as domestic.
     DomesticHint,
+}
+
+pub struct DomainSet {
+    exact: std::collections::HashSet<Box<str>>,
+    suffix: std::collections::HashSet<Box<str>>,
+}
+
+impl DomainSet {
+    fn new(pattern: &str) -> Option<Self> {
+        let mut set = Self {
+            exact: Default::default(),
+            suffix: Default::default(),
+        };
+        for member in crate::config::rules_batch::domain_set_members(pattern) {
+            let (suffix, name) = member.ok()?;
+            if suffix {
+                set.suffix.insert(name.into());
+            } else {
+                set.exact.insert(name.into());
+            }
+        }
+        Some(set)
+    }
+
+    fn contains(&self, mut host: &str) -> bool {
+        if self.exact.contains(host) {
+            return true;
+        }
+        loop {
+            if self.suffix.contains(host) {
+                return true;
+            }
+            let Some((_, rest)) = host.split_once('.') else {
+                return false;
+            };
+            host = rest;
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.exact.len() + self.suffix.len()
+    }
+}
+
+impl std::fmt::Debug for DomainSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DomainSet")
+            .field("domains", &self.len())
+            .finish()
+    }
 }
 
 /// A single rule with its action.
@@ -394,6 +453,7 @@ impl RouteDecision {
 impl MatchRule {
     pub(crate) fn compile_domain(kind: &str, pattern: &str) -> Option<Self> {
         match kind {
+            "domain-set" => Some(Self::DomainSet(Arc::new(DomainSet::new(pattern)?))),
             "domain" => Some(Self::Domain(pattern.to_lowercase())),
             "domain-suffix" => {
                 let suffix = pattern.to_lowercase();
@@ -410,6 +470,7 @@ impl MatchRule {
 
     pub(crate) fn matches_domain(&self, host_lower: &str) -> bool {
         match self {
+            Self::DomainSet(set) => set.contains(host_lower),
             Self::Domain(domain) => host_lower == domain,
             Self::DomainSuffix(suffix) => {
                 host_lower.ends_with(suffix.as_str())
@@ -628,9 +689,10 @@ impl Router {
         port: u16,
     ) -> bool {
         match rule {
-            MatchRule::Domain(_) | MatchRule::DomainSuffix(_) | MatchRule::DomainKeyword(_) => {
-                rule.matches_domain(host_lower)
-            }
+            MatchRule::DomainSet(_)
+            | MatchRule::Domain(_)
+            | MatchRule::DomainSuffix(_)
+            | MatchRule::DomainKeyword(_) => rule.matches_domain(host_lower),
 
             MatchRule::IpCidr { addr, prefix_len } => {
                 ip.is_some_and(|ip| cidr_match(ip, *addr, *prefix_len))

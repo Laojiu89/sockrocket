@@ -71,3 +71,14 @@ c.previewRuleChanges();c.applyRulePreview();add=request('batch_add_rules');
 assert.equal(add[1].text,'DOMAIN,edited.invalid,DIRECT');
 assert.equal(Object.hasOwn(add[1],'preview_token'),false);
 console.log('PASS: unchanged preview reuses token, edited and expired previews submit the retained draft');
+
+add[2]({ok:true});request('get_rules')[2]({ok:true,rules:c.SR_STATE.ruleRows,revision:'v6'});
+c.startRuleImport();
+element('rule-import-url').value='https://example.invalid/cn.mrs';
+c.fetchRuleList();
+const packed='DOMAIN-SET,+.first.example|second.example|+.third.example,DIRECT';
+request('fetch_rule_list')[2]({ok:true,text:packed,count:1,packed_domains:3,preview_token:'b'.repeat(96)});
+assert.match(element('rule-import-state').textContent,/3 个域名/);
+assert.equal(element('rule-batch').value,packed);
+assert.match(element('rule-preview-text').textContent,/域名集合（3 个域名）.*DIRECT/);
+c.applyRulePreview();assert.equal(request('batch_add_rules')[1].preview_token,'b'.repeat(96));

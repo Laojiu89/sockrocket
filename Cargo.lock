@@ -6398,7 +6398,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-cli"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "base64",
@@ -6418,7 +6418,7 @@ dependencies = [
 
 [[package]]
 name = "sockrocket-core"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6483,11 +6483,12 @@ dependencies = [
  "webpki-roots 0.26.11",
  "winreg 0.10.1",
  "x25519-dalek",
+ "zstd",
 ]
 
 [[package]]
 name = "sockrocket-gui"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "chrono",
