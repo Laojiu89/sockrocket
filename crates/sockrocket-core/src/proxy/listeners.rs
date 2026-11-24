@@ -74,7 +74,7 @@ enum Protocol {
     Http(Option<ListenerAuth>),
     Socks(Option<ListenerAuth>),
     Mixed(Option<ListenerAuth>),
-    Shadowsocks(SharedContext, ServerConfig),
+    Shadowsocks(SharedContext, Box<ServerConfig>),
 }
 
 impl Protocol {
@@ -101,7 +101,7 @@ impl Protocol {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("无效的 Shadowsocks 加密方式"))?;
                 let server = ServerConfig::new(config.address(), &config.password, cipher)?;
-                Self::Shadowsocks(context.clone(), server)
+                Self::Shadowsocks(context.clone(), Box::new(server))
             }
         })
     }
