@@ -18,6 +18,19 @@ function fixture() {
   const tick=()=>{const [id,cb]=timers.entries().next().value;timers.delete(id);cb();};
   return {context,requests,request,tick,element,messages,copied,nodeLoads,timerDelays};
 }
+{
+  const calls = [];
+  const nav = vm.createContext({
+    SR_STATE:{page:'home'}, SR_PAGES:['home','subs'], SR_PAGE_LOADED:{}, statsGeneration:0,
+    srElement:() => ({classList:{toggle() {}}, setAttribute() {}}),
+    trafficScope:page => page === 'home' ? 'session' : 'monthly',
+    srLoadSubs:() => calls.push('subscriptions'), refreshStats:() => calls.push('stats')
+  });
+  vm.runInContext(source.slice(source.indexOf('function srShowPage('), source.indexOf('var inboundRows')), nav);
+  nav.srShowPage('subs');
+  assert.deepEqual(calls, ['subscriptions', 'stats']);
+}
+
 const f=fixture();f.context.addSub();
 let start=f.request('subscription_start');
 assert.equal(start[1].action,'add_sub');assert.equal(start[4],12000);
@@ -105,6 +118,8 @@ notes.context.renderSubscriptionNotes({ok:true,compatibility_notes:[]});
 assert.equal(notes.element('sub-notes').hidden,true);
 console.log('PASS: optional names, invalid-address rejection and informational compatibility notes');
 const counted=fixture();counted.context.srLoadSubs();
+assert.deepEqual(counted.requests.map(r => r[0]), ['subscriptions', 'subscription_job'],
+  'opening the tab reads the list before restoring job progress');
 counted.request('subscriptions')[2]({subs:[
   {index:0,name:'First',format:'auto',node_count:71,url:'https://example.invalid/private-one'},
   {index:1,name:'Second',format:'clash',node_count:89,url:'https://example.invalid/private-two'}

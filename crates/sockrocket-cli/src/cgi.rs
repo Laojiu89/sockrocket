@@ -951,14 +951,31 @@ fn validate_advanced_config(text: &str) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct SubscriptionCatalog {
+    nodes: Y,
+    subscriptions: Y,
+}
+
+fn read_subscription_catalog() -> Result<SubscriptionCatalog> {
+    // Listing subscriptions needs no routing rules, device bindings or node-ID migration.
+    let content = fs::read(conf_path())?;
+    Ok(serde_yaml::from_slice::<Option<SubscriptionCatalog>>(&content)?.unwrap_or_default())
+}
+
 fn act_subscriptions() -> J {
-    let Ok(map) = load_conf() else {
+    let Ok(catalog) = read_subscription_catalog() else {
         return err_msg("无法读取订阅配置，请检查配置文件后刷新。");
     };
     let mut node_counts = std::collections::HashMap::<String, usize>::new();
     let mut shared_nodes = 0usize;
-    for value in conf_seq(&map, "nodes") {
-        let Ok(node) = sockrocket_core::Node::from_yaml_value(value.clone()) else {
+    let nodes = match catalog.nodes {
+        Y::Sequence(nodes) => nodes,
+        _ => Vec::new(),
+    };
+    for value in nodes {
+        let Ok(node) = sockrocket_core::Node::from_yaml_value(value) else {
             continue;
         };
         let sources = sockrocket_core::config::dedup::subscription_sources(&node);
@@ -969,8 +986,11 @@ fn act_subscriptions() -> J {
             *node_counts.entry(source).or_default() += 1;
         }
     }
-    let subs: Vec<J> = conf_seq(&map, "subscriptions")
-        .iter()
+    let subs: Vec<J> = catalog
+        .subscriptions
+        .as_sequence()
+        .into_iter()
+        .flatten()
         .enumerate()
         .map(|(i, s)| {
             let get = |k: &str| match s.get(k) {
@@ -5335,6 +5355,26 @@ dns_direct_domains:
         let subs = act_subscriptions()["subs"].as_array().unwrap().clone();
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0]["name"], J::from("Sub 2"));
+    }
+
+    #[test]
+    fn subscription_list_counts_valid_legacy_nodes_with_groups() {
+        let config = r#"
+subscriptions:
+  - {name: Legacy, url: 'https://example.invalid/sub'}
+nodes:
+  - name: Valid
+    server: node.example.invalid
+    port: 443
+    protocol: {type: trojan, password: synthetic}
+    extra: &source {sub_url: 'https://example.invalid/sub'}
+  - {name: Incomplete, extra: *source}
+groups: [{name: Main, members: []}]
+"#;
+        let _env = TestEnv::new(config);
+        let result = act_subscriptions();
+        assert_eq!(result["subs"][0]["node_count"], 1);
+        assert_eq!(result["shared_nodes"], 0);
     }
 
     #[test]

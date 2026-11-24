@@ -17,7 +17,14 @@ vm.runInContext(source.slice(source.indexOf('var TRANSPORT ='), source.indexOf('
 const messages = [], probeResults = [];
 context.srShowMsg = message => messages.push(message);
 context.probeTransport(() => probeResults.push(context.TRANSPORT));
+let earlyReply = 0;
+context.srApi('subscriptions', null, () => earlyReply++);
+assert.equal(requests.length, 1, 'navigation during startup shares the pending transport probe');
 requests.shift().reply(200, '{"version":"test"}');
+const earlyList = requests.shift();
+assert.match(earlyList.url, /action=subscriptions$/);
+earlyList.reply(200, '{"subs":[]}');
+assert.equal(earlyReply, 1);
 assert.deepEqual(probeResults, ['cgi']);
 let failed;
 context.srApi('status', null, () => assert.fail(), error => { failed = error; });
@@ -66,8 +73,37 @@ const boot = source.slice(source.lastIndexOf('probeTransport(function () {'), so
 vm.runInNewContext(boot, {probeTransport: cb => cb(), srLoadNodes: () => bootCalls.push('nodes'),
   refreshStatus: () => bootCalls.push('status'), srPollUpdate: () => bootCalls.push('update-status'), setInterval() {},
   api: action => assert.fail('page boot must not invoke lifecycle: ' + action)});
-assert.deepEqual(bootCalls, ['nodes', 'status', 'update-status']);
+assert.deepEqual(bootCalls, ['status', 'nodes', 'update-status']);
 console.log('PASS: private request nonce/key, priority Stop, result cleanup, timeout and passive boot');
+
+assert.match(source, /id="sr-hero-state">正在确认服务状态</);
+assert.match(source, /id="sr-sb-state">等待状态</);
+assert.match(source, /<button[^>]*id="sr-toggle-btn"[^>]* disabled>等待状态</);
+const statusUi = {}, statusState = {statusKnown:false, status:{}, nodes:[], lat:{}, page:'home'};
+const statusContext = vm.createContext({
+  SR_STATE:statusState, srElement: id => statusUi[id] ||= {style:{}},
+  updateInboundStatus() {}, renderNetworkControls() {}, setProxyModeUi() {},
+  servicePending:false, networkPending:false
+});
+vm.runInContext(source.slice(source.indexOf('function renderChrome()'), source.indexOf('function setChip(')), statusContext);
+statusContext.renderChrome();
+assert.equal(statusUi['hero-state'].textContent, '正在确认服务状态');
+assert.equal(statusUi['st-probe-sub'].textContent, '等待服务状态');
+assert.equal(statusUi['toggle-btn'].disabled, true);
+for (const running of [false, true]) {
+  statusState.statusKnown = true;
+  statusState.status = {running, node_count:0, sub_count:0};
+  statusContext.renderChrome();
+  assert.equal(statusUi['sb-state'].textContent, running ? '运行中' : '已停止');
+  assert.equal(statusUi['toggle-btn'].textContent, running ? '停止服务' : '启动服务');
+  assert.equal(statusUi['toggle-btn'].disabled, false);
+}
+statusState.statusKnown = false;
+statusContext.renderChrome();
+assert.equal(statusUi['sb-state'].textContent, '状态未知');
+assert.equal(statusUi['hero-live'].style.display, 'none');
+assert.equal(statusUi['toggle-btn'].disabled, true);
+console.log('PASS: initial and unconfirmed service status');
 
 const payload={name:'示例 " \\ 节点',url:'https://example.invalid/sub?a=1&b=2'};
 context.apiKscRequest('version',payload,()=>{});
@@ -75,6 +111,22 @@ const encoded=JSON.parse(requests.at(-1).body).fields;
 const stored=Object.values(encoded)[0].replace(/\\/g,'\\\\').replace(/"/g,'\\"');
 assert.deepEqual(JSON.parse(Buffer.from(stored,'base64').toString('utf8')),payload);
 console.log('PASS: UTF-8 JSON survives Softcenter field escaping');
+
+{
+  const dispatches = [];
+  const queue = vm.createContext({
+    apiKscRequest(action, data, cb) { dispatches.push({action, cb}); }
+  });
+  vm.runInContext(source.slice(source.indexOf('var kscQueue'), source.indexOf('function newRequestId')), queue);
+  for (const action of ['status', 'stats', 'del_sub', 'node_details', 'sysinfo', 'subscriptions', 'update_status']) {
+    queue.apiKsc(action, null, () => {});
+  }
+  ['status', 'stats', 'del_sub', 'subscriptions', 'node_details', 'sysinfo', 'update_status'].forEach((action, index) => {
+    assert.equal(dispatches.length, index + 1, 'only one regular RPC runs at a time');
+    assert.equal(dispatches[index].action, action);
+    dispatches[index].cb({});
+  });
+}
 
 const preview={text:'DOMAIN,edited.invalid,DIRECT\n'.repeat(185),group:'测试'};
 const configBody = {config:Buffer.from('# 节点\n'.repeat(600)).toString('base64'), expected_revision:'r1'};

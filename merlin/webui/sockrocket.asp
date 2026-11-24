@@ -370,16 +370,16 @@ body.bg {min-width:0!important}
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
             </div>
             <div class="hero-info">
-              <div class="hero-title"><span id="sr-hero-state">已停止</span><span class="live" id="sr-hero-live" style="display:none">运行中</span></div>
+              <div class="hero-title"><span id="sr-hero-state">正在确认服务状态</span><span class="live" id="sr-hero-live" style="display:none">运行中</span></div>
               <div class="hero-sub" id="sr-hero-node">—</div>
               <div class="hero-sub" id="sr-hero-health" style="display:none"></div>
               <div class="hero-metrics">
                 <span>运行时间 <b id="sr-hero-uptime">—</b></span>
-                <span>节点 <b id="sr-hero-nodes">0</b></span>
-                <span>订阅 <b id="sr-hero-subs">0</b></span>
+                <span>节点 <b id="sr-hero-nodes">—</b></span>
+                <span>订阅 <b id="sr-hero-subs">—</b></span>
               </div>
             </div>
-            <button class="btn btn-success" id="sr-toggle-btn" onclick="toggleService()">启动服务</button>
+            <button class="btn" id="sr-toggle-btn" onclick="toggleService()" disabled>等待状态</button>
           </div>
         </div>
 
@@ -852,13 +852,13 @@ body.bg {min-width:0!important}
   <div id="sr-statusbar">
     <div class="sb-left">
       <span id="sr-sb-dot">●</span>
-      <span id="sr-sb-state">已停止</span>
+      <span id="sr-sb-state">等待状态</span>
       <span id="sr-sb-node" style="overflow:hidden;text-overflow:ellipsis;max-width:280px"></span>
     </div>
     <div class="sb-right">
       <span id="sr-sb-ports">SOCKS :1080 · HTTP :1087</span>
       <span id="sr-sb-uptime"></span>
-      <span id="sr-sb-nodes">0 个节点</span>
+      <span id="sr-sb-nodes">—</span>
       <span id="sr-sb-ver"></span>
     </div>
   </div>
@@ -904,10 +904,15 @@ function sockrocketInitHost() {
 }
 
 var TRANSPORT = null;
+var transportWaiters = null;
 function probeTransport(cb) {
+  if (transportWaiters) { transportWaiters.push(cb); return; }
+  transportWaiters = [cb];
   probeGet('/cgi-bin/sockrocket.cgi?action=version', 2500, function (ok) {
     TRANSPORT = ok ? 'cgi' : 'ksc';
-    cb();
+    var ready = transportWaiters;
+    transportWaiters = null;
+    ready.forEach(function (callback) { callback(); });
   });
 }
 
@@ -944,6 +949,7 @@ function srApi(action, data, cb, errCb, timeoutMs) {
     if (TRANSPORT === 'ksc') return apiKsc(action, data, cb, failed, remaining);
     return apiXhr(action, data, cb, failed, remaining);
   }
+  if (!TRANSPORT) return probeTransport(attempt);
   return attempt();
 }
 
@@ -997,7 +1003,13 @@ function apiKsc(action, data, cb, errCb, timeoutMs) {
     if (errCb) errCb({ error_code: 'busy' });
     return;
   }
-  kscQueue.push([action, data, cb, errCb, timeoutMs]);
+  var index = kscQueue.length;
+  if (action === 'subscriptions') {
+    // Show the visible list before queued background reads, preserving write order.
+    var background = ['stats', 'sysinfo', 'node_details', 'update_status', 'subscription_job'];
+    while (index > 0 && background.indexOf(kscQueue[index - 1][0]) !== -1) index--;
+  }
+  kscQueue.splice(index, 0, [action, data, cb, errCb, timeoutMs]);
   drainKscQueue();
 }
 function drainKscQueue() {
@@ -1232,7 +1244,7 @@ function srShowPage(p) {
     srElement('nav-' + id).setAttribute('aria-selected', id === p ? 'true' : 'false');
     srElement('nav-' + id).tabIndex = id === p ? 0 : -1;
   });
-  if (scopeChanged) { statsGeneration++; refreshStats(); }
+  if (scopeChanged) statsGeneration++;
   if (p === 'nodes') renderNodes();
   if (!SR_PAGE_LOADED[p]) {
     SR_PAGE_LOADED[p] = true;
@@ -1243,6 +1255,7 @@ function srShowPage(p) {
     if (p === 'network' && !dnsPolicyDirty) loadNetworkPolicy();
     if (p === 'logs') loadLog();
   }
+  if (scopeChanged) refreshStats();
 }
 
 var inboundRows = [], inboundRevision = '', inboundBusy = false, inboundOriginal = null;
@@ -1590,7 +1603,7 @@ function renderSubscriptionTraffic(traffic) {
 }
 function renderChrome() {
   var st = SR_STATE.status, uptime = SR_STATE.uptime, si = SR_STATE.sysinfo || {};
-  var running = !!st.running;
+  var running = SR_STATE.statusKnown && st.running === true;
   updateInboundStatus(SR_STATE.statusKnown ? running : null);
   var pill = srElement('service-pill');
   pill.textContent = !SR_STATE.statusKnown ? '状态未知' : running ? '运行中' : '已停止';
@@ -1609,9 +1622,9 @@ function renderChrome() {
   var runtime = probe.runtime || {}, tun = runtime.tun || {};
   var active = tun.running && typeof tun.active === 'number' ? tun.active : runtime.active_connections;
   srElement('st-connections').textContent = running && typeof active === 'number' ? String(active) : '—';
-  srElement('st-connections-sub').textContent = !running ? '服务未运行' : typeof active !== 'number' ? '当前版本未提供计数' : tun.running ? 'TUN 会话 · 约每 30 秒更新' : '代理连接 · 约每 30 秒更新';
+  srElement('st-connections-sub').textContent = !SR_STATE.statusKnown ? '等待服务状态' : !running ? '服务未运行' : typeof active !== 'number' ? '当前版本未提供计数' : tun.running ? 'TUN 会话 · 约每 30 秒更新' : '代理连接 · 约每 30 秒更新';
   srElement('st-probe').textContent = running && age >= 0 && age < 120 && probe.last_probe_ms != null ? probe.last_probe_ms + ' ms' : '—';
-  srElement('st-probe-sub').textContent = !running ? '服务未运行' : probe.consecutive_failures > 0 ? '最近探测失败' : age >= 0 && age < 120 ? '最近检查通过' : '近期没有探测结果';
+  srElement('st-probe-sub').textContent = !SR_STATE.statusKnown ? '等待服务状态' : !running ? '服务未运行' : probe.consecutive_failures > 0 ? '最近探测失败' : age >= 0 && age < 120 ? '最近检查通过' : '近期没有探测结果';
   srElement('st-service-uptime').textContent = running && uptime && uptime !== 'stopped' ? uptime : '—';
   // title bar
   var nbName = srElement('nb-name');
@@ -1630,8 +1643,8 @@ function renderChrome() {
     (SR_STATE.nodes[st.active_node] ? SR_STATE.nodes[st.active_node].name : '') +
     (activeLat != null ? ' · ' + latText(activeLat) : '');
   srElement('sb-ports').textContent = 'SOCKS :' + (st.socks_port || 1080) + ' · HTTP :' + (st.http_port || 1087);
-  srElement('sb-uptime').textContent = uptime && uptime !== 'stopped' ? '↑ ' + uptime : '';
-  srElement('sb-nodes').textContent = (st.node_count || 0) + ' 个节点';
+  srElement('sb-uptime').textContent = running && uptime && uptime !== 'stopped' ? '↑ ' + uptime : '';
+  srElement('sb-nodes').textContent = st.node_count != null ? st.node_count + ' 个节点' : '—';
   srElement('sb-ver').textContent = st.version || '';
 
   // home hero
@@ -1643,7 +1656,7 @@ function renderChrome() {
   var n = SR_STATE.nodes[st.active_node];
   srElement('hero-node').textContent = n
     ? n.name + ' · ' + (n.protocol || '?') + ' · ' + (n.port || '?')
-    : (st.node_count > 0 ? '节点 #' + st.active_node : '暂无节点，请先添加订阅或节点');
+    : (st.node_count == null ? '—' : st.node_count > 0 ? '节点 #' + st.active_node : '暂无节点，请先添加订阅或节点');
   srElement('hero-uptime').textContent = running ? (uptime || '—') : '—';
   // health check line: probe latency / failure streak / failover history
   var hh = srElement('hero-health');
@@ -1664,13 +1677,13 @@ function renderChrome() {
   } else {
     hh.style.display = 'none';
   }
-  srElement('hero-nodes').textContent = st.node_count || 0;
-  srElement('hero-subs').textContent = st.sub_count || 0;
+  srElement('hero-nodes').textContent = st.node_count != null ? st.node_count : '—';
+  srElement('hero-subs').textContent = st.sub_count != null ? st.sub_count : '—';
   var tb = srElement('toggle-btn');
   tb.disabled = servicePending || !SR_STATE.statusKnown || (networkPending && !running);
   tb.textContent = servicePending ? '正在处理…' : !SR_STATE.statusKnown ? '等待状态' : running ? '停止服务' : '启动服务';
-  tb.className = 'btn ' + (running ? 'btn-danger' : 'btn-success');
-  tb.title=running?'停止服务并清理 DNS 接管与 TUN':'启动服务，默认同时开启 DNS 接管与 TUN';
+  tb.className = !SR_STATE.statusKnown ? 'btn' : running ? 'btn btn-danger' : 'btn btn-success';
+  tb.title=!SR_STATE.statusKnown?'等待服务状态':running?'停止服务并清理 DNS 接管与 TUN':'启动服务，默认同时开启 DNS 接管与 TUN';
 
   renderNetworkControls();
   setProxyModeUi(st.proxy_mode || 'rule');
@@ -1882,17 +1895,17 @@ function saveSpeedTests() {
 }
 var nodeLoadError = '', nodeLoadGeneration = 0;
 function refreshNodeCatalogs() {
+  if (SR_STATE.page === 'subs') srLoadSubs();
+  else {
+    ++subscriptionListGeneration;
+    SR_PAGE_LOADED.subs = false;
+  }
   // The overview also reads node details, even when the nodes page is closed.
   srLoadNodes();
   PG_REVISION = null;
   ++PG_LOAD_GENERATION;
   if (SR_STATE.page === 'nodes') loadProxyGroups();
   else SR_PAGE_LOADED.nodes = false;
-  if (SR_STATE.page === 'subs') srLoadSubs();
-  else {
-    ++subscriptionListGeneration;
-    SR_PAGE_LOADED.subs = false;
-  }
   if (SR_STATE.page === 'dns') srLoadRules();
   else SR_PAGE_LOADED.dns = false;
 }
@@ -2160,7 +2173,6 @@ function srLoadSubs() {
     SR_PAGE_LOADED.subs = false;
     srElement('sub-list').textContent = (d && d.msg) || '订阅读取失败，请刷新。';
   }
-  restoreSubscriptionJob();
   srApi('subscriptions', null, function (d) {
     if (generation !== subscriptionListGeneration) return;
     var el = srElement('sub-list');
@@ -2181,6 +2193,7 @@ function srLoadSubs() {
         '</div>';
     }).join('');
   }, failed);
+  restoreSubscriptionJob();
 }
 function findSubscription(i) {
   return SR_STATE.subs.find(function (sub) { return Number(sub.index) === Number(i); });
@@ -4293,8 +4306,8 @@ srElement('sidebar').addEventListener('keydown', function (event) {
 
 probeTransport(function () {
   // Opening the settings page must never change the user's stopped state.
-  srLoadNodes();
   refreshStatus(true);
+  srLoadNodes();
   srPollUpdate();
   var tick = 0;
   setInterval(function () { if (!document.hidden) refreshStatus(++tick % 3 === 0); }, 10000);
