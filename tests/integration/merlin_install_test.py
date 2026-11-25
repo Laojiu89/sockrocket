@@ -169,21 +169,69 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         dns_hook.symlink_to(target)
         subprocess.run(register, env=hook_env, check=True)
         assert dns_hook.is_symlink()
-        target.write_text('#!/bin/sh\n' + other)
-        assert subprocess.run(register, env=hook_env).returncode != 0
-        assert dns_hook.is_symlink() and target.read_text() == '#!/bin/sh\n' + other
-        dns_hook.unlink()
-        malformed = '#!/bin/sh\n# >>> SOCKROCKET_AUTO_START >>>\n' + other
-        dns_hook.write_text(malformed)
-        assert subprocess.run(register, env=hook_env).returncode != 0
-        assert dns_hook.read_text() == malformed
-
         uninstall = Path('merlin/uninstall.sh').read_text()
         dns_cleanup = uninstall[uninstall.index('dns_hook=/jffs/scripts/dnsmasq.postconf'):
                                 uninstall.index('ok "Hooks cleaned"')].replace('/jffs/scripts/dnsmasq.postconf', str(dns_hook))
         # BusyBox and GNU sed accept -i without an argument; BSD sed needs an empty suffix.
         if sys.platform == 'darwin':
             dns_cleanup = dns_cleanup.replace("sed -i ", "sed -i '' ")
+        # Real registration, firmware callback and uninstall, including a
+        # relative link and a target with spaces. A firmware hook may exit.
+        dns_hook.unlink()
+        saved = Path(str(dns_hook) + '.sockrocket-original')
+        main_conf = root / 'dnsmasq.conf'
+        snippet = root / 'sockrocket.conf'
+        upstream = root / 'private-upstream'
+        hook_env.update(SOCKROCKET_DNS_MAIN_CONFIG=str(main_conf), SOCKROCKET_DNSMASQ_DIR=str(root),
+                        SOCKROCKET_DNS_UPSTREAM_FILE=str(upstream))
+        target = hook_dir / 'firmware DNS hook'
+        firmware = '#!/bin/sh\nprintf "%s\\n" "$@" >> "$CALLS"\necho server=192.0.2.53 > "$1"\nexit "${FIRMWARE_STATUS:-0}"\n'
+        target.write_text(firmware)
+        target.chmod(0o755)
+        calls = root / 'firmware-calls'
+        hook_env['CALLS'] = str(calls)
+        for link in (str(target), target.name):
+            dns_hook.symlink_to(link)
+            for _ in range(2):
+                subprocess.run(register, env=hook_env, check=True)
+            assert os.readlink(saved) == link and target.read_text() == firmware
+            assert not dns_hook.is_symlink() and dns_hook.read_text().count('# >>> SOCKROCKET_AUTO_START >>>') == 1
+            calls.write_text('')
+            snippet.touch()
+            upstream.write_text('server=127.0.0.1#5300\n')
+            subprocess.run([str(dns_hook), str(main_conf)], env=hook_env, check=True)
+            assert main_conf.read_text().splitlines() == ['no-resolv', 'server=127.0.0.1#5300']
+            subprocess.run([str(dns_hook), str(main_conf), '2', 'extra arg'], env=hook_env, check=True)
+            assert main_conf.read_text() == 'server=192.0.2.53\n'
+            assert calls.read_text().splitlines() == [str(main_conf), str(main_conf), '2', 'extra arg']
+            assert subprocess.run([str(dns_hook), str(main_conf)],
+                                  env=dict(hook_env, FIRMWARE_STATUS='7')).returncode == 7
+            assert main_conf.read_text() == 'server=192.0.2.53\n'
+            snippet.unlink()
+            subprocess.run([str(dns_hook), str(main_conf)], env=hook_env, check=True)
+            assert main_conf.read_text() == 'server=192.0.2.53\n'
+            run(dns_cleanup)
+            assert os.readlink(dns_hook) == link and not saved.is_symlink()
+            assert target.read_text() == firmware and target.stat().st_mode & 0o777 == 0o755
+            dns_hook.unlink()
+        # Refuse broken links, non-executables and pre-existing backup conflicts.
+        dns_hook.symlink_to('missing')
+        assert subprocess.run(register, env=hook_env).returncode != 0 and os.readlink(dns_hook) == 'missing'
+        dns_hook.unlink()
+        dns_hook.symlink_to(target)
+        target.chmod(0o644)
+        assert subprocess.run(register, env=hook_env).returncode != 0 and dns_hook.is_symlink()
+        target.chmod(0o755)
+        saved.write_text('unrelated')
+        assert subprocess.run(register, env=hook_env).returncode != 0 and dns_hook.is_symlink()
+        assert saved.read_text() == 'unrelated'
+        saved.unlink()
+        dns_hook.unlink()
+        malformed = '#!/bin/sh\n# >>> SOCKROCKET_AUTO_START >>>\n' + other
+        dns_hook.write_text(malformed)
+        assert subprocess.run(register, env=hook_env).returncode != 0
+        assert dns_hook.read_text() == malformed
+
         run(dns_cleanup)
         assert dns_hook.read_text() == malformed
         dns_hook.write_text('#!/bin/sh\n' + managed + other)
@@ -192,7 +240,7 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-install-') as directory:
         dns_hook.unlink()
         dns_hook.symlink_to(target)
         run(dns_cleanup)
-        assert dns_hook.is_symlink() and target.read_text() == '#!/bin/sh\n' + other
+        assert dns_hook.is_symlink() and target.read_text() == firmware
 
         def event(name, *args):
             subprocess.run(['sh', str(hook_dir / name), *args], env=env, check=True)

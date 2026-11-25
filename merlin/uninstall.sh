@@ -127,7 +127,21 @@ if [ -f "$dns_hook" ] && [ ! -L "$dns_hook" ] && awk '
     /^# <<< SOCKROCKET_AUTO_END <<<$/ { if (!inside) exit 1; inside=0 }
     END { if (inside || !found) exit 1 }
 ' "$dns_hook"; then
-    sed -i '/^# >>> SOCKROCKET_AUTO_START >>>$/,/^# <<< SOCKROCKET_AUTO_END <<<$/d' "$dns_hook"
+    dns_original="$dns_hook.sockrocket-original"
+    dns_chain='"$0.sockrocket-original" "$@" || exit $?'
+    # If another add-on added commands, keep its script and the original
+    # dispatcher call. Replace a pristine dispatcher with the original link.
+    if [ -L "$dns_original" ] && awk -v chain="$dns_chain" '
+        NR == 1 && $0 == "#!/bin/sh" { next }
+        NR == 2 && $0 == chain { chained=1; next }
+        /^# >>> SOCKROCKET_AUTO_START >>>$/,/^# <<< SOCKROCKET_AUTO_END <<<$/ { next }
+        { extra=1 }
+        END { exit (!chained || extra) }
+    ' "$dns_hook"; then
+        mv -f "$dns_original" "$dns_hook" || exit 1
+    else
+        sed -i '/^# >>> SOCKROCKET_AUTO_START >>>$/,/^# <<< SOCKROCKET_AUTO_END <<<$/d' "$dns_hook"
+    fi
 fi
 ok "Hooks cleaned"
 
