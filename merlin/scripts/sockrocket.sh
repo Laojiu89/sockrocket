@@ -492,6 +492,10 @@ ensure_dns_postconf_hook() (
     local snippet="${SOCKROCKET_DNSMASQ_DIR:-/jffs/configs/dnsmasq.d}/sockrocket.conf"
     local upstream="${SOCKROCKET_DNS_UPSTREAM_FILE:-/tmp/sockrocket-resolv.dnsmasq}"
     local body="if [ -f \"$snippet\" ] && [ -f \"$upstream\" ] && [ -x \"$helper\" ]; then \"$helper\" \"\$1\" \"\${2:-}\"; fi"
+    # Keep the original symlink beside the dispatcher so relative targets
+    # still resolve and firmware updates to its target take effect.
+    local original="$hook.sockrocket-original"
+    local chain='"$0.sockrocket-original" "$@" || exit $?'
     # Only trust a reachable registration. Older installers appended the
     # block, sometimes after an existing exit. Rebuild those regular hooks.
     expect_hook_line() {
@@ -502,7 +506,12 @@ ensure_dns_postconf_hook() (
         local line
         IFS= read -r line || return 1
         case "$line" in '#!'*/sh|'#!'*/ash|'#!'*/bash|'#!'*/sh\ *|'#!'*/ash\ *|'#!'*/bash\ *) ;; *) return 1 ;; esac
-        expect_hook_line "$begin" && IFS= read -r line || return 1
+        IFS= read -r line || return 1
+        if [ "$line" = "$chain" ]; then
+            [ ! -L "$hook" ] && [ -L "$original" ] && [ -f "$original" ] && [ -x "$original" ] || return 1
+            IFS= read -r line || return 1
+        fi
+        [ "$line" = "$begin" ] && IFS= read -r line || return 1
         if [ "$line" = "$body" ]; then
             expect_hook_line "$end"
             return $?
@@ -520,10 +529,6 @@ ensure_dns_postconf_hook() (
         [ -x "$hook" ] || { [ ! -L "$hook" ] && chmod u+x "$hook"; }
         return $?
     fi
-    if [ -L "$hook" ]; then
-        log_error "Merlin DNS hook is managed by a symlink; cannot register Sockrocket in $hook"
-        return 1
-    fi
     [ ! -e "$hook" ] || [ -f "$hook" ] || return 1
     mkdir -p "${hook%/*}" || return 1
     stage="$hook.sockrocket-$$"
@@ -531,8 +536,31 @@ ensure_dns_postconf_hook() (
     trap 'rm -f "$stage/hook"; rmdir "$stage" 2>/dev/null || true' EXIT
     trap 'exit 1' HUP INT TERM
     input=/dev/null
-    if [ -f "$hook" ]; then
+    chained=0
+    if [ -L "$hook" ]; then
+        [ -f "$hook" ] && [ -x "$hook" ] || { log_error "Unusable Merlin DNS hook: $hook"; return 1; }
+        # No-clobber link creation. A retry after an interrupted publication
+        # may already have saved this exact link.
+        target=$(readlink "$hook") || { registered < "$hook"; return $?; }
+        if [ ! -L "$original" ] && [ ! -e "$original" ]; then
+            ln -s -- "$target" "$original" 2>/dev/null || [ -L "$original" ] || return 1
+        fi
+        if [ ! -L "$original" ] || [ "$(readlink "$original")" != "$target" ] || [ ! "$original" -ef "$hook" ]; then
+            # A concurrent registration may already have published the dispatcher.
+            [ -f "$hook" ] && [ ! -L "$hook" ] && registered < "$hook" && return 0
+            log_error "Conflicting saved DNS hook: $original"
+            return 1
+        fi
+        chained=1
+    elif [ -f "$hook" ]; then
         input="$hook"
+        if { expect_hook_line '#!/bin/sh' && expect_hook_line "$chain"; } < "$hook"; then
+            [ -L "$original" ] && [ -f "$original" ] && [ -x "$original" ] || {
+                log_error "Saved Merlin DNS hook missing or unusable: $original"
+                return 1
+            }
+            chained=1
+        fi
         cp -p "$hook" "$stage/hook" || return 1
     fi
     # The offline installer can have a stripped PATH. Copy only the
@@ -547,6 +575,10 @@ ensure_dns_postconf_hook() (
             '#!'*) return 1 ;;
             *) printf '#!/bin/sh\n' || return 1 ;;
         esac
+        if [ "$chained" = 1 ]; then
+            [ "$input" = /dev/null ] || expect_hook_line "$chain" || return 1
+            printf '%s\n' "$chain" || return 1
+        fi
         printf '%s\n' "$begin" "$body" "$end" || return 1
         # Scripts without a shebang can start with a third-party command.
         [ -z "$first" ] || printf '%s\n' "$first" || return 1
