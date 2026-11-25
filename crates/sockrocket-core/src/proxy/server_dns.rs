@@ -178,6 +178,7 @@ mod tests {
             ServerDns {
                 servers: vec!["1.1.1.1".into()],
                 bootstrap: vec![],
+                insecure_servers: vec![],
                 ipv6: false,
             },
             false,

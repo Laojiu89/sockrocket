@@ -1588,6 +1588,9 @@ fn build_uri_transport(
 
 /// Encode a Node back to its share URI (best-effort, simplified transport params).
 pub fn node_to_share_uri(node: &Node) -> String {
+    if node.extra.contains_key(super::ech::KEY) {
+        return String::new();
+    }
     let name_enc = urlencoding::encode(&node.name);
 
     let mut qparams: Vec<String> = Vec::new();

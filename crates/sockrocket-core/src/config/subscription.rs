@@ -18,6 +18,7 @@ use super::v2ray;
 pub enum SubFormat {
     Clash,
     SingBox,
+    Shadowrocket,
     V2Ray,
     Base64Lines,
     PlainLines,
@@ -498,13 +499,14 @@ fn subscription_addresses(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> 
     out
 }
 
-fn subscription_entry_count(content: &str) -> usize {
+pub fn subscription_entry_count(content: &str) -> usize {
     fn count(text: &str) -> usize {
         let text = text.trim_start_matches('\u{feff}').trim();
         if text.starts_with("[Interface]") {
             return 1;
         }
         match detect_format(text) {
+            SubFormat::Shadowrocket => super::shadowrocket::entries(text).count(),
             SubFormat::Clash => super::storage::parse_yaml_document(text)
                 .ok()
                 .and_then(|value| value.get("proxies")?.as_sequence().map(Vec::len))
@@ -562,8 +564,21 @@ pub fn parse_subscription_content(content: &str, format_hint: &str) -> Result<Ve
     }
 
     match format_hint {
-        "clash" => return clash::parse_clash_config(content),
-        "singbox" | "sing-box" => return singbox::parse_singbox_config(content),
+        "clash" | "singbox" | "sing-box" => {
+            // The selected format describes the document inside the optional envelope.
+            let decoded;
+            let document = if looks_like_base64(content) {
+                decoded = decode_subscription_text(content)?;
+                decoded.trim_start_matches('\u{feff}').trim()
+            } else {
+                content
+            };
+            return if format_hint == "clash" {
+                clash::parse_clash_config(document)
+            } else {
+                singbox::parse_singbox_config(document)
+            };
+        }
         // UI / docs historically labeled base64 share-URI lists as "v2ray".
         // Real V2Ray JSON (`outbounds`) is still accepted via fallback or
         // the explicit `v2ray-json` hint.
@@ -590,6 +605,7 @@ pub fn parse_subscription_content(content: &str, format_hint: &str) -> Result<Ve
     tracing::info!("Auto-detected subscription format: {:?}", format);
 
     match format {
+        SubFormat::Shadowrocket => Ok(super::shadowrocket::parse(content)),
         SubFormat::Clash => clash::parse_clash_config(content),
         SubFormat::SingBox => singbox::parse_singbox_config(content),
         SubFormat::V2Ray => v2ray::parse_v2ray_config(content),
@@ -601,6 +617,10 @@ pub fn parse_subscription_content(content: &str, format_hint: &str) -> Result<Ve
 /// Detect the format of subscription content
 pub fn detect_format(content: &str) -> SubFormat {
     let trimmed = content.trim();
+
+    if super::shadowrocket::is_config(trimmed) {
+        return SubFormat::Shadowrocket;
+    }
 
     // Check for Clash YAML
     if clash::is_clash_config(trimmed) {
@@ -663,6 +683,9 @@ fn parse_base64_lines(content: &str) -> Result<Vec<Node>> {
     let text = text.trim_start_matches('\u{feff}').trim();
     if text.starts_with("[Interface]") {
         return super::wireguard::parse_profile(text).map(|node| vec![node]);
+    }
+    if super::shadowrocket::is_config(text) {
+        return Ok(super::shadowrocket::parse(text));
     }
     // Decode only one envelope. Use the same JSON precedence as plain imports.
     if clash::is_clash_config(text) {
@@ -1104,6 +1127,59 @@ mod tests {
                 assert_eq!(nodes.len(), 1);
                 assert_eq!(nodes[0].name, expected[0].name);
             }
+        }
+    }
+
+    #[test]
+    fn clash_and_singbox_feeds_preserve_a_shared_node_across_refreshes() {
+        use super::super::dedup::{
+            apply_subscription_refresh, remove_subscription_nodes, subscription_sources,
+        };
+
+        let clash = "proxies:\n  - {name: sample, type: ss, server: example.invalid, port: 443, cipher: aes-128-gcm, password: sample, udp: true}";
+        let singbox = r#"{"outbounds":[{"type":"shadowsocks","tag":"sample","server":"example.invalid","server_port":443,"method":"aes-128-gcm","password":"sample"}]}"#;
+        let mut config = AppConfig::default();
+        let mut feeds = Vec::new();
+        for (format, body) in [("clash", clash), ("singbox", singbox)] {
+            let url = format!("https://example.invalid/sub/sample/{format}?carrier=china_telecom");
+            let plain = parse_subscription_content(body, "auto").unwrap();
+            assert_eq!(plain.len(), 1);
+            let expected = crate::node_fingerprint(&plain[0]);
+            let wrapped = general_purpose::STANDARD.encode(format!("\u{feff}{body}\n"));
+            for payload in [body, wrapped.as_str()] {
+                for hint in ["auto", format] {
+                    let nodes = parse_subscription_content(payload, hint).unwrap();
+                    assert_eq!(nodes.len(), 1);
+                    assert_eq!(crate::node_fingerprint(&nodes[0]), expected);
+                }
+            }
+            config.subscriptions.push(Subscription {
+                name: format.into(),
+                url: url.clone(),
+                format: format.into(),
+                last_updated: None,
+                refresh_interval_hours: 24,
+                refresh_revision: String::new(),
+            });
+            feeds.push((url, plain));
+        }
+        for feed in &feeds {
+            assert!(apply_subscription_refresh(&mut config, vec![feed.clone()]));
+        }
+        assert!(apply_subscription_refresh(&mut config, feeds.clone()));
+        assert_eq!(config.nodes.len(), 1);
+        assert_eq!(
+            subscription_sources(&config.nodes[0]),
+            feeds.iter().map(|(url, _)| url.clone()).collect()
+        );
+        for (removed, retained) in [(0, 1), (1, 0)] {
+            let mut saved = config.clone();
+            remove_subscription_nodes(&mut saved, &feeds[removed].0);
+            assert_eq!(saved.nodes.len(), 1);
+            assert_eq!(
+                subscription_sources(&saved.nodes[0]),
+                [feeds[retained].0.clone()].into()
+            );
         }
     }
 

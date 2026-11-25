@@ -64,7 +64,7 @@ impl Hysteria2Outbound {
         mut endpoint: quinn::Endpoint,
         alpn: &str,
     ) -> Result<AuthenticatedSession> {
-        endpoint.set_default_client_config(self.build_client_config(alpn)?);
+        endpoint.set_default_client_config(self.build_client_config(alpn).await?);
         let connecting = endpoint
             .connect(addr, &self.sni)
             .map_err(|e| anyhow::anyhow!("QUIC connect setup to {} failed: {}", addr, e))?;
@@ -114,6 +114,7 @@ pub struct Hysteria2Outbound {
     sni: String,
     skip_cert_verify: bool,
     certificate_pin: Option<[u8; 32]>,
+    pub(super) ech: Option<crate::config::ech::EchSource>,
     chrome_fingerprint: bool,
     socket_options: Option<Arc<super::hysteria2_socket::Options>>,
     down_bps: u64,
@@ -196,6 +197,7 @@ impl Hysteria2Outbound {
             password: password.to_string(),
             sni,
             skip_cert_verify,
+            ech: None,
             chrome_fingerprint,
             socket_options: None,
             certificate_pin: extra
@@ -238,17 +240,30 @@ impl Hysteria2Outbound {
         Ok(())
     }
     /// Build a QUIC client config (TLS + transport) for a given ALPN.
-    fn build_client_config(&self, alpn: &str) -> Result<quinn::ClientConfig> {
+    async fn build_client_config(&self, alpn: &str) -> Result<quinn::ClientConfig> {
         let config_builder = if self.chrome_fingerprint {
             super::quic_fingerprint::client_config
         } else {
             build_quic_client_config_pinned
         };
-        let mut client_config = config_builder(
-            self.skip_cert_verify,
-            &[alpn.to_string()],
-            self.certificate_pin,
-        )?;
+        let mut client_config = if let Some(ech) = &self.ech {
+            let tls = ech
+                .tls_config(
+                    self.skip_cert_verify,
+                    self.certificate_pin,
+                    &[alpn.to_string()],
+                )
+                .await?;
+            quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
+                tls,
+            )?))
+        } else {
+            config_builder(
+                self.skip_cert_verify,
+                &[alpn.to_string()],
+                self.certificate_pin,
+            )?
+        };
 
         // Transport config: BBR congestion control for Hysteria2
         let mut transport = quinn::TransportConfig::default();

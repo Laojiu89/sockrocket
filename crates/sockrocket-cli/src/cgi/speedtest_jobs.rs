@@ -152,8 +152,10 @@ pub fn worker(id: &str) -> Result<()> {
                 let slots = protocol_slots.clone();
                 tasks.spawn(async move {
                     let key = key(index, &raw);
-                    let result = async {
-                        let node = sockrocket_core::Node::from_yaml_value(raw)?;
+                    let Ok(node) = sockrocket_core::Node::from_yaml_value(raw) else {
+                        return json!({"key":key,"latency":-1,"failure":"invalid node"});
+                    };
+                    let result: Result<u32> = async {
                         let quick = use_tcp_probe(&node, http);
                         let _permit = if quick {
                             None
@@ -163,7 +165,10 @@ pub fn worker(id: &str) -> Result<()> {
                         probe_node_latency(&node, quick).await
                     }
                     .await;
-                    json!({"key":key,"latency":result.map(i64::from).unwrap_or(-1)})
+                    match result {
+                        Ok(ms) => json!({"key":key,"latency":ms}),
+                        Err(err) => json!({"key":key,"latency":-1,"failure":sockrocket_core::classify_probe_error(&err).label()}),
+                    }
                 });
             }
             let Some(result) = tasks.join_next().await else {

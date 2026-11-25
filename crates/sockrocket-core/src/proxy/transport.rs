@@ -1261,6 +1261,7 @@ pub struct TlsConnFactory {
     sni: String,
     use_tls: bool,
     connector: TlsConnector,
+    pub(super) ech: Option<(crate::config::ech::EchSource, bool, Vec<String>)>,
     /// Separate connector performing the REALITY handshake, if applicable.
     reality_connector: Option<TlsConnector>,
     /// Classic-X25519-only REALITY connector, used as a one-shot retry when
@@ -1467,6 +1468,7 @@ impl TlsConnFactory {
             sni,
             use_tls,
             connector: build_tls_connector(tls_config),
+            ech: None,
             reality_connector,
             reality_classic_connector,
             reality_error,
@@ -1512,15 +1514,20 @@ impl ConnFactory for TlsConnFactory {
             } else {
                 self.reality_connector.as_ref().unwrap_or(&self.connector)
             };
-            let stream = connect_with_connector(
-                &self.server,
-                self.port,
-                connector,
-                &self.sni,
-                self.use_tls,
-                Duration::from_secs(15),
-            )
-            .await;
+            let stream = if let Some((ech, insecure, alpn)) = &self.ech {
+                ech.connect(&self.server, self.port, &self.sni, *insecure, None, alpn)
+                    .await
+            } else {
+                connect_with_connector(
+                    &self.server,
+                    self.port,
+                    connector,
+                    &self.sni,
+                    self.use_tls,
+                    Duration::from_secs(15),
+                )
+                .await
+            };
             let stream = match stream {
                 Ok(s) => s,
                 Err(e)

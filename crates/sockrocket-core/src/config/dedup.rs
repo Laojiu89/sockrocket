@@ -246,7 +246,7 @@ pub fn refresh_with_dns_migrations(
 }
 
 // The full identity is used by saved references; the DNS-independent identity
-// is used only to match the same endpoint within its subscription.
+// is used only to compare DNS policies for the same endpoint.
 fn dns_fingerprints(node: &Node) -> (String, String) {
     let id = node_fingerprint(node);
     if !node.extra.contains_key(super::server_dns::KEY) {
@@ -255,6 +255,59 @@ fn dns_fingerprints(node: &Node) -> (String, String) {
     let mut endpoint = node.clone();
     endpoint.extra.remove(super::server_dns::KEY);
     (node_fingerprint(&endpoint), id)
+}
+
+/// Reconciliation of two manual imports that use different formats for the same endpoint.
+pub enum FileDnsMatch {
+    AlreadyConfigured,
+    Upgrade { index: usize, old: String },
+}
+
+/// An endpoint can be reconciled only when it has a single saved manual row
+/// and a single incoming definition. Distinct explicit DNS policies stay separate.
+pub fn file_dns_matches(saved: &[Node], incoming: &[Node]) -> HashMap<String, FileDnsMatch> {
+    if !saved
+        .iter()
+        .chain(incoming)
+        .any(|node| node.extra.contains_key(super::server_dns::KEY))
+    {
+        return HashMap::new();
+    }
+    let mut existing = HashMap::new();
+    for (index, node) in saved.iter().enumerate() {
+        let (endpoint, id) = dns_fingerprints(node);
+        let candidate = subscription_sources(node).is_empty().then_some((index, id));
+        existing
+            .entry(endpoint)
+            .and_modify(|slot| *slot = None)
+            .or_insert(candidate);
+    }
+    let mut candidates = HashMap::<String, BTreeSet<String>>::new();
+    for node in incoming {
+        let (endpoint, id) = dns_fingerprints(node);
+        if existing.get(&endpoint).is_some_and(Option::is_some) {
+            candidates.entry(endpoint).or_default().insert(id);
+        }
+    }
+    candidates
+        .into_iter()
+        .filter_map(|(endpoint, mut ids)| {
+            if ids.len() != 1 {
+                return None;
+            }
+            let new = ids.pop_first()?;
+            let (index, old) = existing.remove(&endpoint).flatten()?;
+            if old == new {
+                None
+            } else if old == endpoint {
+                Some((new, FileDnsMatch::Upgrade { index, old }))
+            } else if new == endpoint {
+                Some((new, FileDnsMatch::AlreadyConfigured))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn dns_migrations(old: &[Node], refreshed: &[(String, Vec<Node>)]) -> HashMap<String, String> {
@@ -862,6 +915,31 @@ mod tests {
             )]
         ));
         assert_eq!(config.active_node, None);
+    }
+
+    #[test]
+    fn file_dns_match_requires_unique_manual_endpoint_and_policy() {
+        let bare = ss("HK", "node.invalid", 443, "pw");
+        let mut a = bare.clone();
+        a.extra
+            .insert(super::super::server_dns::KEY.into(), "a".into());
+        let mut b = a.clone();
+        b.extra
+            .insert(super::super::server_dns::KEY.into(), "b".into());
+        let mut subscription = bare.clone();
+        tag_subscription_nodes(
+            std::slice::from_mut(&mut subscription),
+            "https://source.invalid/a",
+        );
+        for (saved, incoming) in [
+            (vec![bare.clone()], vec![a.clone(), b.clone()]),
+            (vec![a.clone(), b.clone()], vec![bare.clone()]),
+            (vec![a.clone()], vec![b.clone()]),
+            (vec![subscription.clone()], vec![a.clone()]),
+            (vec![bare, subscription], vec![a]),
+        ] {
+            assert!(file_dns_matches(&saved, &incoming).is_empty());
+        }
     }
 
     #[test]

@@ -135,7 +135,7 @@ fn query_param(name: &str) -> Option<String> {
 fn request_body_limit(action: &str) -> u64 {
     match action {
         // The backup is base64 inside JSON, so about 6 MiB of YAML fits.
-        "save_config" => 8 * 1024 * 1024,
+        "save_config" | "import_nodes" => 8 * 1024 * 1024,
         // The editable preview may contain 2 MiB plus JSON escaping and framing.
         "batch_add_rules" | "replace_rule_group" => 4 * 1024 * 1024,
         _ => 1024 * 1024,
@@ -614,6 +614,7 @@ fn dispatch_inner(action: &str, post: &J) -> J {
         "speedtest_job" => speedtest_jobs::status(),
         "node_details" => act_nodes(true),
         "add_node" => act_add_node(post),
+        "import_nodes" => act_import_nodes(post),
         "del_node" => act_del_node(post),
         "sysinfo" => act_sysinfo(),
         "get_direct_domains" => act_get_direct_domains(),
@@ -1554,7 +1555,7 @@ fn act_speedtest_node(post: &J) -> J {
     let node = match sockrocket_core::Node::from_yaml_value(node.clone()) {
         Ok(n) => n,
         Err(e) => {
-            return json!({"ok": false, "latency": -1, "msg": format!("Failed to parse config for node {index}: {e}")});
+            return json!({"ok": false, "latency": -1, "failure": "invalid node", "msg": format!("Failed to parse config for node {index}: {e}")});
         }
     };
     let quick = use_tcp_probe(&node, post.get("mode").and_then(J::as_str) == Some("http"));
@@ -1586,10 +1587,106 @@ fn act_speedtest_node(post: &J) -> J {
             json!({"ok": true, "latency": ms, "server": server, "port": port, "path": if quick { "tcp" } else { "http" }})
         }
         Ok(Err(e)) => {
-            json!({"ok": false, "latency": -1, "msg": format!("Probe via {server}:{port} failed: {e:#}")})
+            json!({"ok": false, "latency": -1, "failure": sockrocket_core::classify_probe_error(&e).label(), "msg": format!("Probe via {server}:{port} failed: {e:#}")})
         }
         Err(_) => json!({"ok": false, "latency": -1, "msg": "Speed test thread panicked"}),
     }
+}
+
+fn act_import_nodes(post: &J) -> J {
+    use sockrocket_core::config::subscription::{
+        parse_subscription_content, subscription_entry_count,
+    };
+
+    let Some(content) = post.get("content").and_then(J::as_str) else {
+        return err_msg("请选择节点配置文件。");
+    };
+    let Ok(parsed) = parse_subscription_content(content, "auto") else {
+        return err_msg("无法读取节点定义，请检查配置文件的格式及内容。");
+    };
+    let mut skipped = subscription_entry_count(content).saturating_sub(parsed.len());
+    let Ok(mut map) = load_conf() else {
+        return err_msg("无法读取现有配置。");
+    };
+    let mut saved = match map.remove("nodes") {
+        Some(Y::Sequence(nodes)) => nodes,
+        None | Some(Y::Null) => Vec::new(),
+        _ => return err_msg("现有节点列表格式无效。"),
+    };
+    let mut fingerprints = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    let mut existing = Vec::with_capacity(saved.len());
+    for value in &saved {
+        let Ok(node) = sockrocket_core::Node::from_yaml_value(value.clone()) else {
+            return err_msg("现有节点列表格式无效。");
+        };
+        fingerprints.insert(sockrocket_core::node_fingerprint(&node));
+        names.insert(node.name.clone());
+        existing.push(node);
+    }
+    use sockrocket_core::config::dedup::{FileDnsMatch, file_dns_matches};
+    let mut dns_matches = file_dns_matches(&existing, &parsed);
+    drop(existing);
+    let mut migrations = std::collections::HashMap::new();
+    let mut suffixes = std::collections::HashMap::new();
+    let mut added = 0;
+    let mut duplicates = 0;
+    for mut node in parsed {
+        if validate_manual_node(&node).is_err() {
+            skipped += 1;
+            continue;
+        }
+        let id = sockrocket_core::node_fingerprint(&node);
+        if !fingerprints.insert(id.clone()) {
+            duplicates += 1;
+            continue;
+        }
+        match dns_matches.remove(&id) {
+            Some(FileDnsMatch::AlreadyConfigured) => {
+                duplicates += 1;
+                continue;
+            }
+            Some(FileDnsMatch::Upgrade { index, old }) => {
+                let key = sockrocket_core::config::server_dns::KEY;
+                saved[index]["extra"][key] = ykey(&node.extra[key]);
+                fingerprints.remove(&old);
+                migrations.insert(old, id);
+                continue;
+            }
+            None => {}
+        }
+        if !names.insert(node.name.clone()) {
+            let number = suffixes.entry(node.name.clone()).or_insert(2usize);
+            loop {
+                let name = format!("{} #{number}", node.name);
+                *number += 1;
+                if names.insert(name.clone()) {
+                    node.name = name;
+                    break;
+                }
+            }
+        }
+        let Ok(value) = serde_yaml::to_value(&node) else {
+            return err_msg("无法生成节点配置。");
+        };
+        saved.push(value);
+        added += 1;
+    }
+    let updated = migrations.len();
+    if added + duplicates + updated == 0 {
+        return err_msg(format!(
+            "文件中没有可用节点。跳过 {skipped} 条无效或不支持的定义。"
+        ));
+    }
+    if added + updated > 0 {
+        sockrocket_core::config::node_identity::remap_references(&mut map, &migrations);
+        map.insert(ykey("nodes"), Y::Sequence(saved));
+        if let Err(error) = save_conf(&map) {
+            return save_failed(&error);
+        }
+    }
+    json!({"ok":true, "added":added, "updated":updated, "duplicates":duplicates, "skipped":skipped,
+        "msg":format!("已添加 {added} 个节点，更新 {updated} 个，已有 {duplicates} 个，跳过 {skipped} 条无效或不支持的定义。")})
 }
 
 fn act_add_node(post: &J) -> J {
@@ -4281,6 +4378,7 @@ mod tests {
     async fn api_enforces_each_action_body_limit() {
         for (action, mib) in [
             ("save_config", 8),
+            ("import_nodes", 8),
             ("batch_add_rules", 4),
             ("replace_rule_group", 4),
             ("add_node", 1),
@@ -5281,6 +5379,133 @@ dns_direct_domains:
         // Out-of-range rejected.
         let r = act_set_node(&json!({"index": 5}));
         assert_eq!(r["ok"], J::Bool(false));
+    }
+
+    #[test]
+    fn local_node_files_merge_three_formats_and_keep_other_config() {
+        let _env = TestEnv::new(SAMPLE);
+        let clash = "proxies:\n  - {name: Local, type: ss, server: example.invalid, port: 8443, cipher: aes-128-gcm, password: sample, udp: true}\nrules: [MATCH,DIRECT]";
+        let singbox = r#"{"outbounds":[{"tag":"Local","type":"shadowsocks","server":"example.invalid","server_port":8443,"method":"aes-128-gcm","password":"sample"},{"type":"selector","tag":"group","outbounds":["Local"]}]}"#;
+        let rocket = "[General]\nipv6 = true\n[Proxy]\nLocal = ss, example.invalid, 8443, method=aes-128-gcm, password=sample, udp=1\nLocal = trojan, other.invalid, 443, password=sample, peer=tls.invalid\nBad = unknown, ignored.invalid, 443\n[Rule]\nFINAL,DIRECT";
+        let import = |content| dispatch("import_nodes", &json!({"content":content}));
+        let before = load_conf().unwrap();
+        let start = conf_seq(&before, "nodes").len();
+        assert_eq!(import(clash)["added"], 1);
+        let r = import(singbox);
+        assert_eq!(
+            (
+                r["added"].as_u64(),
+                r["duplicates"].as_u64(),
+                r["skipped"].as_u64()
+            ),
+            (Some(0), Some(1), Some(0))
+        );
+        let r = import(rocket);
+        assert_eq!(
+            (
+                r["added"].as_u64(),
+                r["duplicates"].as_u64(),
+                r["skipped"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1))
+        );
+        let new = load_app_config().unwrap();
+        assert_eq!(new.nodes.len(), start + 2);
+        assert_eq!(new.nodes.last().unwrap().name, "Local #2");
+        assert_eq!(
+            new.nodes
+                .last()
+                .unwrap()
+                .transport
+                .as_ref()
+                .unwrap()
+                .tls
+                .as_ref()
+                .unwrap()
+                .sni
+                .as_deref(),
+            Some("tls.invalid")
+        );
+        let mut after = load_conf().unwrap();
+        after.insert(ykey("nodes"), before["nodes"].clone());
+        assert_eq!(after, before);
+        let saved = fs::read(conf_path()).unwrap();
+        assert_eq!(import(rocket)["added"], 0);
+        assert_eq!(import("[Rule]\nFINAL,DIRECT")["ok"], false);
+        assert_eq!(saved, fs::read(conf_path()).unwrap());
+    }
+
+    #[test]
+    fn file_reimport_upgrades_missing_endpoint_dns_in_place() {
+        let _env = TestEnv::new(SAMPLE);
+        let proxies = "proxies:\n  - {name: Downloaded, type: anytls, server: node.example, port: 443, password: sample}";
+        let import = |content: &str| dispatch("import_nodes", &json!({"content":content}));
+        assert_eq!(import(proxies)["added"], 1);
+        let mut map = load_conf().unwrap();
+        let index = map["nodes"].as_sequence().unwrap().len() - 1;
+        let mut rows = map["nodes"].clone();
+        rows[index]["name"] = ykey("Renamed by user");
+        rows[index]["user_extension"] = ykey("preserved");
+        let old = sockrocket_core::Node::from_yaml_value(rows[index].clone()).unwrap();
+        let old_id = sockrocket_core::node_fingerprint(&old);
+        let target = |id: &str| format!("node:{}", sockrocket_core::node_public_id(id));
+        map.insert(ykey("nodes"), rows);
+        map.insert(ykey("active_node"), serde_yaml::to_value(index).unwrap());
+        map.insert(
+            ykey("groups"),
+            serde_yaml::to_value(
+                json!([{"name":"Imported","type":"select","members":[old_id],"current":old_id}]),
+            )
+            .unwrap(),
+        );
+        map.insert(
+            ykey("rules"),
+            serde_yaml::to_value(
+                json!([{"rule_type":"domain","pattern":"sample.example","target":target(&old_id)}]),
+            )
+            .unwrap(),
+        );
+        save_conf(&map).unwrap();
+
+        let file = |dns: &str| format!("dns:\n  proxy-server-nameserver: [{dns}]\n{proxies}");
+        let updated = import(&file("192.0.2.53"));
+        assert_eq!(
+            (
+                updated["added"].as_u64(),
+                updated["updated"].as_u64(),
+                updated["duplicates"].as_u64()
+            ),
+            (Some(0), Some(1), Some(0)),
+            "{updated}"
+        );
+        let saved = load_conf().unwrap();
+        let node = sockrocket_core::Node::from_yaml_value(saved["nodes"][index].clone()).unwrap();
+        let new_id = sockrocket_core::node_fingerprint(&node);
+        assert_ne!(old_id, new_id);
+        assert_eq!(saved["active_node"].as_u64(), Some(index as u64));
+        assert_eq!(node.name, "Renamed by user");
+        assert_eq!(
+            saved["nodes"][index]["user_extension"].as_str(),
+            Some("preserved")
+        );
+        assert_eq!(
+            saved["groups"][0]["current"].as_str(),
+            Some(new_id.as_str())
+        );
+        assert_eq!(
+            saved["groups"][0]["members"][0].as_str(),
+            Some(new_id.as_str())
+        );
+        assert_eq!(
+            saved["rules"][0]["target"].as_str(),
+            Some(target(&new_id).as_str())
+        );
+        assert_eq!(import(&file("192.0.2.53"))["duplicates"], 1);
+        assert_eq!(import(proxies)["duplicates"], 1);
+        assert_eq!(load_conf().unwrap(), saved);
+        assert_eq!(import(&file("198.51.100.53"))["added"], 1);
+        assert_eq!(import(proxies)["added"], 1); // ambiguous across two explicit policies
+        assert_eq!(load_conf().unwrap()["nodes"][index], saved["nodes"][index]);
     }
 
     #[test]

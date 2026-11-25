@@ -548,6 +548,7 @@ mod tests {
                 let policy = super::super::server_dns::ServerDns {
                     servers: vec![server.into()],
                     bootstrap: Vec::new(),
+                    insecure_servers: Vec::new(),
                     ipv6: false,
                 };
                 fresh.extra.insert(

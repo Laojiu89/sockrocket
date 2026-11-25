@@ -13,6 +13,9 @@ pub const KEY: &str = "proxy_server_dns";
 pub struct ServerDns {
     pub servers: Vec<String>,
     pub bootstrap: Vec<String>,
+    /// Only explicitly designated upstream DoH connections may skip certificate checks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub insecure_servers: Vec<usize>,
     #[serde(default)]
     pub ipv6: bool,
 }
@@ -40,10 +43,32 @@ impl ServerDns {
                 Ok(addr)
             })
             .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            self.insecure_servers
+                .iter()
+                .all(|i| *i < self.servers.len()),
+            "Invalid proxy DNS TLS override"
+        );
         let servers = self
             .servers
             .iter()
-            .map(|v| parse_server(v, &bootstrap))
+            .enumerate()
+            .map(|(index, value)| {
+                let server = parse_server(value, &bootstrap)?;
+                if !self.insecure_servers.contains(&index) {
+                    return Ok(server);
+                }
+                match server {
+                    DnsServer::Endpoint {
+                        url,
+                        proxy: false,
+                        bootstrap,
+                    } if url.starts_with("https://") => {
+                        Ok(DnsServer::UnverifiedDoh { url, bootstrap })
+                    }
+                    _ => anyhow::bail!("Proxy DNS TLS override requires a direct HTTPS endpoint"),
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(DnsConfig {
             servers,
@@ -119,7 +144,7 @@ fn parse_policy(
     value: &serde_yaml::Value,
     field: &str,
 ) -> Result<Option<ServerDns>> {
-    let servers: Vec<String> = serde_yaml::from_value(value.clone())
+    let mut servers: Vec<String> = serde_yaml::from_value(value.clone())
         .map_err(|_| anyhow::anyhow!("{field} must be a list of strings"))?;
     if servers.is_empty() {
         return Ok(None);
@@ -138,9 +163,26 @@ fn parse_policy(
             bootstrap.push(addr.to_string());
         }
     }
+    // Mihomo puts resolver transport options in the URL fragment. Consume
+    // only the known HTTPS verification option. All other fragments remain
+    // subject to the endpoint validator.
+    let mut insecure_servers = Vec::new();
+    for (index, server) in servers.iter_mut().enumerate() {
+        if server.starts_with("https://")
+            && let Some((url, option)) = server.split_once('#')
+        {
+            match option {
+                "skip-cert-verify=true" => insecure_servers.push(index),
+                "skip-cert-verify=false" => {}
+                _ => continue,
+            }
+            server.truncate(url.len());
+        }
+    }
     let policy = ServerDns {
         servers,
         bootstrap,
+        insecure_servers,
         ipv6: dns
             .get("ipv6")
             .and_then(serde_yaml::Value::as_bool)
@@ -224,6 +266,32 @@ proxies:
         assert_eq!(p.bootstrap, ["223.5.5.5:53"]);
         assert!(p.servers[3].ends_with("/dns-query/synthetic?key=test"));
     }
+    #[test]
+    fn mihomo_doh_verification_option_is_scoped_to_one_endpoint() {
+        let raw = "dns: {proxy-server-nameserver: ['https://192.0.2.1:8448/dns-query/token?x=1#skip-cert-verify=true', 'https://192.0.2.2/dns-query#skip-cert-verify=false', 'https://192.0.2.3/dns-query']}";
+        let policy = parse(raw).unwrap().unwrap();
+        assert_eq!(policy.insecure_servers, [0]);
+        assert_eq!(
+            policy.servers[0],
+            "https://192.0.2.1:8448/dns-query/token?x=1"
+        );
+        assert!(matches!(
+            policy.config().unwrap().servers.as_slice(),
+            [
+                DnsServer::UnverifiedDoh { .. },
+                DnsServer::Endpoint { .. },
+                DnsServer::Endpoint { .. }
+            ]
+        ));
+        for fragment in [
+            "skip-cert-verify=true&ecs=1",
+            "proxy",
+            "skip-cert-verify=maybe",
+        ] {
+            assert!(parse(&raw.replace("skip-cert-verify=true", fragment)).is_err());
+        }
+    }
+
     #[test]
     fn invalid_policies_fail_without_disclosing_private_urls() {
         for value in [

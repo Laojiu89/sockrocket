@@ -12,12 +12,27 @@ use super::model::*;
 
 // --- Sing-box config structures ---
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct SingBoxConfig {
     #[serde(default)]
     outbounds: Vec<serde_json::Value>,
     #[serde(default)]
     endpoints: Vec<serde_json::Value>,
+    #[serde(default)]
+    dns: ProfileDns,
+    #[serde(default)]
+    route: ProfileRoute,
+}
+
+#[derive(Default, Deserialize)]
+struct ProfileDns {
+    #[serde(default)]
+    servers: Vec<serde_json::Value>,
+}
+
+#[derive(Default, Deserialize)]
+struct ProfileRoute {
+    default_domain_resolver: Option<serde_json::Value>,
 }
 
 #[allow(dead_code)]
@@ -101,6 +116,7 @@ struct SingBoxTls {
     reality: Option<SingBoxReality>,
     #[serde(default, flatten)]
     extensions: HashMap<String, serde_json::Value>,
+    ech: Option<super::ech::Options>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,39 +171,24 @@ pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
     let config: SingBoxConfig =
         serde_json::from_slice(json_str.as_bytes()).context("Failed to parse sing-box JSON")?;
 
+    let outbounds = config.outbounds.iter().chain(&config.endpoints);
     let mut tagged = HashMap::new();
     if config
         .outbounds
         .iter()
         .any(|out| out.get("detour").is_some())
     {
-        // A duplicate tag may refer to more than one endpoint.
-        for value in config.outbounds.iter().chain(config.endpoints.iter()) {
-            if let Some(tag) = value["tag"].as_str() {
-                tagged
-                    .entry(tag)
-                    .and_modify(|slot| *slot = None)
-                    .or_insert(Some(value));
-            }
-        }
+        tagged = index_tags(outbounds.clone());
     }
+    let resolvers = index_tags(config.dns.servers.iter());
     let mut nodes = Vec::new();
-    for value in config.outbounds.iter().chain(config.endpoints.iter()) {
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("wireguard") {
-            match super::wireguard::from_singbox(value) {
-                Ok(node) => nodes.push(node),
-                Err(_) => tracing::warn!("Skipping invalid or unsupported WireGuard endpoint"),
-            }
-            continue;
-        }
-        let outbound: SingBoxOutbound = match SingBoxOutbound::deserialize(value) {
-            Ok(v) => v,
-            Err(_) => {
-                tracing::warn!("Skipping malformed sing-box outbound");
-                continue;
-            }
-        };
-        match convert_singbox_outbound(&outbound, &tagged) {
+    for value in outbounds {
+        match parse_entry(
+            value,
+            &tagged,
+            &resolvers,
+            config.route.default_domain_resolver.as_ref(),
+        ) {
             Ok(Some(node)) => nodes.push(node),
             Ok(None) => {}
             Err(_) => tracing::warn!("Skipping unsupported or invalid sing-box outbound"),
@@ -196,16 +197,182 @@ pub fn parse_singbox_config(json_str: &str) -> Result<Vec<Node>> {
     Ok(nodes)
 }
 
+type Tags<'a> = HashMap<&'a str, Option<&'a serde_json::Value>>;
+
+fn index_tags<'a>(values: impl Iterator<Item = &'a serde_json::Value>) -> Tags<'a> {
+    let mut tagged = Tags::new();
+    for value in values {
+        if let Some(tag) = value["tag"].as_str().filter(|t| !t.is_empty()) {
+            tagged
+                .entry(tag)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(value));
+        }
+    }
+    tagged
+}
+
 /// Parse a single sing-box outbound JSON object.
 pub fn parse_singbox_outbound(json_str: &str) -> Result<Option<Node>> {
     let value: serde_json::Value =
-        serde_json::from_slice(json_str.as_bytes()).context("Failed to parse sing-box outbound")?;
-    if value.get("type").and_then(serde_json::Value::as_str) == Some("wireguard") {
-        return super::wireguard::from_singbox(&value).map(Some);
+        serde_json::from_str(json_str).context("Failed to parse sing-box outbound")?;
+    parse_entry(&value, &Tags::new(), &Tags::new(), None)
+}
+
+fn parse_entry(
+    value: &serde_json::Value,
+    tagged: &Tags<'_>,
+    resolvers: &Tags<'_>,
+    default_resolver: Option<&serde_json::Value>,
+) -> Result<Option<Node>> {
+    let mut node = if value["type"] == "wireguard" {
+        super::wireguard::from_singbox(value)?
+    } else {
+        let outbound =
+            SingBoxOutbound::deserialize(value).context("Malformed sing-box outbound")?;
+        let Some(node) = convert_singbox_outbound(&outbound, tagged)? else {
+            return Ok(None);
+        };
+        node
+    };
+    if node
+        .server
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .is_err()
+    {
+        // A detoured node dials the detour server, whose DNS settings govern that lookup.
+        let dialer = value["detour"]
+            .as_str()
+            .and_then(|tag| tagged.get(tag).copied().flatten())
+            .unwrap_or(value);
+        if let Some(reference) = dialer.get("domain_resolver").or(default_resolver) {
+            let policy = endpoint_resolver(reference, resolvers)?;
+            node.extra.insert(
+                super::server_dns::KEY.into(),
+                serde_json::to_string(&policy)?,
+            );
+        }
     }
-    let outbound: SingBoxOutbound =
-        serde_json::from_value(value).context("Failed to parse sing-box outbound")?;
-    convert_singbox_outbound(&outbound, &HashMap::new())
+    Ok(Some(node))
+}
+
+// A subscription's dialer DNS resolves the proxy server only. Its client-facing
+// DNS rules and final resolver are independent of the imported node.
+fn endpoint_resolver(
+    reference: &serde_json::Value,
+    servers: &Tags<'_>,
+) -> Result<super::server_dns::ServerDns> {
+    use anyhow::ensure;
+    use std::net::{IpAddr, SocketAddr};
+    let (tag, strategy) = if let Some(tag) = reference.as_str() {
+        (tag, "")
+    } else {
+        let options = reference
+            .as_object()
+            .context("Invalid sing-box domain resolver")?;
+        ensure!(
+            options
+                .keys()
+                .all(|k| matches!(k.as_str(), "server" | "strategy")),
+            "Unsupported sing-box domain resolver options"
+        );
+        (
+            reference["server"]
+                .as_str()
+                .context("Missing sing-box resolver tag")?,
+            match options.get("strategy") {
+                None => "",
+                Some(value) => value.as_str().context("Invalid resolver strategy")?,
+            },
+        )
+    };
+    let ipv6 = match strategy {
+        "" | "prefer_ipv4" => true,
+        "ipv4_only" => false,
+        _ => anyhow::bail!("Unsupported proxy resolver strategy"),
+    };
+    let server = servers
+        .get(tag)
+        .copied()
+        .flatten()
+        .context("Missing or ambiguous sing-box DNS server")?;
+    let fields = server.as_object().context("Invalid sing-box DNS server")?;
+    ensure!(
+        fields.keys().all(|k| matches!(
+            k.as_str(),
+            "type" | "tag" | "server" | "server_port" | "path" | "tls"
+        )),
+        "Unsupported sing-box DNS server options"
+    );
+    let host: IpAddr = server["server"]
+        .as_str()
+        .context("Missing DNS server")?
+        .parse()
+        .context("Proxy DNS requires a bootstrap IP address")?;
+    let kind = server["type"].as_str().context("Missing DNS server type")?;
+    let port = match fields.get("server_port") {
+        None => {
+            if kind == "https" {
+                443
+            } else {
+                53
+            }
+        }
+        Some(value) => u16::try_from(value.as_u64().context("Invalid DNS port")?)
+            .context("Invalid DNS port")?,
+    };
+    let address = SocketAddr::new(host, port);
+    let mut insecure_servers = Vec::new();
+    let endpoint = match kind {
+        "https" => {
+            let path = match fields.get("path") {
+                None => "/dns-query",
+                Some(v) => v.as_str().context("Malformed HTTPS DNS path")?,
+            };
+            ensure!(
+                path.starts_with('/') && !path.contains(['#', '\r', '\n']),
+                "Invalid HTTPS DNS path"
+            );
+            if let Some(tls) = fields.get("tls") {
+                let opts = tls.as_object().context("Invalid DNS TLS options")?;
+                ensure!(
+                    opts.keys()
+                        .all(|k| matches!(k.as_str(), "enabled" | "insecure")),
+                    "Unsupported DNS TLS options"
+                );
+                ensure!(
+                    opts.get("enabled")
+                        .is_none_or(|v| v.as_bool() == Some(true)),
+                    "HTTPS DNS requires TLS"
+                );
+                if let Some(flag) = opts.get("insecure")
+                    && flag
+                        .as_bool()
+                        .context("Invalid DNS TLS verification mode")?
+                {
+                    insecure_servers.push(0);
+                }
+            }
+            format!("https://{address}{path}")
+        }
+        "udp" | "tcp" => {
+            ensure!(
+                !fields.contains_key("tls") && !fields.contains_key("path"),
+                "Invalid plain DNS server options"
+            );
+            format!("{kind}://{address}")
+        }
+        _ => anyhow::bail!("Unsupported sing-box DNS transport"),
+    };
+    let policy = super::server_dns::ServerDns {
+        servers: vec![endpoint],
+        bootstrap: Vec::new(),
+        insecure_servers,
+        ipv6,
+    };
+    policy.config()?;
+    Ok(policy)
 }
 
 // sing-box accepts Go duration strings, including compound and fractional units.
@@ -254,6 +421,9 @@ struct ShadowTlsDetour {
     server_port: u16,
     password: String,
     tls: ShadowTlsDetourTls,
+    // Parsed from the dialer value together with the parent profile.
+    #[serde(rename = "domain_resolver")]
+    _resolver: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Deserialize)]
@@ -532,7 +702,7 @@ fn convert_singbox_outbound(
         decode_display_name(&ob.tag)
     };
 
-    let node = Node {
+    let mut node = Node {
         name,
         server,
         port,
@@ -542,6 +712,9 @@ fn convert_singbox_outbound(
         tags: vec![],
         extra,
     };
+    if let Some(ech) = ob.tls.as_ref().and_then(|tls| tls.ech.as_ref()) {
+        ech.attach(&mut node)?;
+    }
     if matches!(node.protocol, ProxyProtocol::Hysteria2 { .. }) {
         crate::create_outbound_unwarmed(&node)?;
     }
@@ -688,6 +861,79 @@ fn build_singbox_transport(ob: &SingBoxOutbound) -> Result<Option<TransportConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_only_the_resolver_for_dialing_each_node() {
+        use super::super::server_dns::{KEY, ServerDns};
+        use crate::dns::DnsServer;
+        use serde_json::json;
+
+        let base =
+            json!({"type":"anytls","server":"node.example","server_port":443,"password":"fixture"});
+        let mut plain = base.clone();
+        plain["domain_resolver"] = json!({"server":"override","strategy":"ipv4_only"});
+        let mut literal = base.clone();
+        literal["server"] = json!("192.0.2.33");
+        let profile = json!({
+            "dns":{"servers":[
+                {"tag":"subscriber","type":"https","server":"192.0.2.53","server_port":8448,
+                 "path":"/dns-query/private-fixture?format=wire","tls":{"enabled":true,"insecure":true}},
+                {"tag":"override","type":"https","server":"2001:db8::53"},
+                {"tag":"local","type":"local"}],
+                "final":"local","rules":[{"clash_mode":"Direct","server":"local"}]},
+            "route":{"default_domain_resolver":{"server":"subscriber","strategy":"prefer_ipv4"}},
+            "outbounds":[base,plain,literal]});
+        let nodes = parse_singbox_config(&profile.to_string()).unwrap();
+        assert_eq!(nodes.len(), 3);
+        let restored: Node =
+            serde_yaml::from_str(&serde_yaml::to_string(&nodes[0]).unwrap()).unwrap();
+        let private = ServerDns::from_node(&restored).unwrap().unwrap();
+        assert_eq!(
+            private.servers,
+            ["https://192.0.2.53:8448/dns-query/private-fixture?format=wire"]
+        );
+        assert!(private.ipv6);
+        assert!(matches!(
+            private.config().unwrap().servers.as_slice(),
+            [DnsServer::UnverifiedDoh { .. }]
+        ));
+        assert!(!restored.transport.unwrap().tls.unwrap().skip_cert_verify);
+        let verified = ServerDns::from_node(&nodes[1]).unwrap().unwrap();
+        assert_eq!(verified.servers, ["https://[2001:db8::53]:443/dns-query"]);
+        assert!(!verified.ipv6);
+        assert!(matches!(
+            verified.config().unwrap().servers.as_slice(),
+            [DnsServer::Endpoint { .. }]
+        ));
+        assert!(!nodes[2].extra.contains_key(KEY));
+    }
+
+    #[test]
+    fn unusable_dialer_dns_skips_only_the_dependent_node() {
+        use serde_json::json;
+        let upstream = json!({"tag":"resolver","type":"https","server":"192.0.2.53",
+            "path":"/private-fixture","tls":{"enabled":true}});
+        let node = json!({"type":"anytls","server":"node.example","server_port":443,
+            "password":"fixture","domain_resolver":"resolver"});
+        let mut plain = node.clone();
+        plain.as_object_mut().unwrap().remove("domain_resolver");
+        let mut pinned = upstream.clone();
+        pinned["tls"]["certificate_public_key_sha256"] = json!(["fixture"]);
+        let mut bad = upstream.clone();
+        bad["type"] = json!("fakeip");
+        for resolvers in [
+            vec![],
+            vec![upstream.clone(), upstream],
+            vec![pinned],
+            vec![bad],
+        ] {
+            let profile = json!({"dns":{"servers":resolvers},"outbounds":[node,plain]});
+            let nodes = parse_singbox_config(&profile.to_string()).unwrap();
+            assert_eq!(nodes.len(), 1);
+            assert!(!nodes[0].extra.contains_key(super::super::server_dns::KEY));
+        }
+        assert!(parse_singbox_outbound(&node.to_string()).is_err());
+    }
 
     #[test]
     fn unresolved_detours_and_unsupported_plugins_do_not_dial_plain_ss() {

@@ -24,6 +24,21 @@ use sockrocket_core::{
     set_route_journal_path, setup_tun_routes, tun_requirements, tun_supported,
 };
 
+// LLVM emits C23 min/max libcalls for soft-float ARM. Merlin's musl
+// does not export them. Use the IEEE implementations already in the lockfile.
+#[cfg(all(target_arch = "arm", target_env = "musl", target_abi = "eabi"))]
+mod soft_float_math {
+    #[unsafe(no_mangle)]
+    extern "C" fn fmaximum_num(x: f64, y: f64) -> f64 {
+        libm::fmaximum_num(x, y)
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn fminimum_num(x: f64, y: f64) -> f64 {
+        libm::fminimum_num(x, y)
+    }
+}
+
 fn main() -> Result<()> {
     if let Some(result) = sockrocket_core::network_guardian::run_if_requested() {
         return result;

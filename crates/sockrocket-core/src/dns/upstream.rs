@@ -167,6 +167,10 @@ impl DnsResolver {
                 self.exchange_endpoint(server, url, *proxy, bootstrap, query)
                     .await?
             }
+            DnsServer::UnverifiedDoh { url, bootstrap } => {
+                self.exchange_endpoint(server, url, false, bootstrap, query)
+                    .await?
+            }
             DnsServer::Tcp(addr) | DnsServer::Tls(addr, _) => {
                 let stream = connect_upstream(
                     &SharedOutbound::direct(),
@@ -462,6 +466,14 @@ impl DnsResolver {
         collect_bootstrap(&mut tasks).await
     }
 
+    fn endpoint_tls_connector(&self, server: &DnsServer) -> &tokio_rustls::TlsConnector {
+        if matches!(server, DnsServer::UnverifiedDoh { .. }) {
+            &UNVERIFIED_DOH_TLS
+        } else {
+            &self.tls_connector
+        }
+    }
+
     async fn exchange_endpoint(
         &self,
         server: &DnsServer,
@@ -470,8 +482,11 @@ impl DnsResolver {
         bootstrap: &[SocketAddr],
         query: &[u8],
     ) -> Result<Vec<u8>> {
-        use http_body_util::{BodyExt, Full};
         let url = url::Url::parse(value).map_err(|_| anyhow::anyhow!("Invalid DNS endpoint"))?;
+        anyhow::ensure!(
+            !matches!(server, DnsServer::UnverifiedDoh { .. }) || url.scheme() == "https",
+            "Unverified DoH requires HTTPS"
+        );
         let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
         let server_name = url
             .query_pairs()
@@ -550,7 +565,7 @@ impl DnsResolver {
                 connected.ok_or_else(|| anyhow::anyhow!("DNS endpoint connection failed"))?;
             if matches!(url.scheme(), "tls" | "https") {
                 Box::new(
-                    self.tls_connector
+                    self.endpoint_tls_connector(server)
                         .connect(
                             rustls_pki_types::ServerName::try_from(if url.scheme() == "tls" {
                                 server_name
@@ -578,59 +593,117 @@ impl DnsResolver {
             });
             return Ok(reply);
         }
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
-        // Owned by this exchange even on timeout/cancellation; never detach
-        // the HTTP driver into a permanent background task.
-        let exchange = async {
-            let path = if url.path().is_empty() {
-                "/dns-query"
-            } else {
-                url.path()
-            };
-            let path = match url.query() {
-                Some(q) => format!("{path}?{q}"),
-                None => path.to_owned(),
-            };
-            let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
-            let request = http::Request::post(path)
-                .header("Host", authority)
-                .header("Content-Type", "application/dns-message")
-                .header("Accept", "application/dns-message")
-                .body(Full::new(bytes::Bytes::copy_from_slice(query)))?;
-            let response = sender.send_request(request).await?;
-            anyhow::ensure!(
-                response.status().is_success(),
-                "DNS HTTPS returned HTTP {}",
-                response.status().as_u16()
-            );
-            anyhow::ensure!(
-                response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|s| s.to_str().ok())
-                    .is_some_and(|s| s.split(';').next().is_some_and(|kind| kind
-                        .trim()
-                        .eq_ignore_ascii_case("application/dns-message"))),
-                "DNS HTTPS returned an invalid content type"
-            );
-            let mut body = response.into_body();
-            let mut reply = Vec::new();
-            while let Some(frame) = body.frame().await {
-                if let Ok(data) = frame?.into_data() {
-                    anyhow::ensure!(reply.len() + data.len() <= 65535, "Oversized DoH response");
-                    reply.extend_from_slice(&data);
-                }
-            }
-            Ok::<_, anyhow::Error>(reply)
+        exchange_https(stream, &url, query).await
+    }
+}
+
+async fn exchange_https(stream: BoxProxyStream, url: &url::Url, query: &[u8]) -> Result<Vec<u8>> {
+    use http_body_util::{BodyExt, Full};
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
+    // Owned by this exchange even on timeout/cancellation; never detach
+    // the HTTP driver into a permanent background task.
+    let exchange = async {
+        let path = if url.path().is_empty() {
+            "/dns-query"
+        } else {
+            url.path()
         };
-        tokio::pin!(connection);
-        tokio::pin!(exchange);
-        tokio::select! {
-            biased;
-            result = &mut exchange => result,
-            _ = &mut connection => exchange.await,
+        let path = match url.query() {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_owned(),
+        };
+        let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
+        let request = http::Request::post(path)
+            .header("Host", authority)
+            .header("Content-Type", "application/dns-message")
+            .header("Accept", "application/dns-message")
+            .body(Full::new(bytes::Bytes::copy_from_slice(query)))?;
+        let response = sender.send_request(request).await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "DNS HTTPS returned HTTP {}",
+            response.status().as_u16()
+        );
+        anyhow::ensure!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|s| s.to_str().ok())
+                .is_some_and(|s| s.split(';').next().is_some_and(|kind| kind
+                    .trim()
+                    .eq_ignore_ascii_case("application/dns-message"))),
+            "DNS HTTPS returned an invalid content type"
+        );
+        let mut body = response.into_body();
+        let mut reply = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame?.into_data() {
+                anyhow::ensure!(reply.len() + data.len() <= 65535, "Oversized DoH response");
+                reply.extend_from_slice(&data);
+            }
         }
+        Ok::<_, anyhow::Error>(reply)
+    };
+    tokio::pin!(connection);
+    tokio::pin!(exchange);
+    tokio::select! {
+        biased;
+        result = &mut exchange => result,
+        _ = &mut connection => exchange.await,
+    }
+}
+
+static UNVERIFIED_DOH_TLS: std::sync::LazyLock<tokio_rustls::TlsConnector> =
+    std::sync::LazyLock::new(|| {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = DohPrivateCertificate(provider.signature_verification_algorithms);
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("ring supports rustls' safe default protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    });
+
+// The subscription may explicitly waive certificate identity checks for its DoH server.
+// Still verify that the peer signed the handshake using the presented certificate.
+#[derive(Debug)]
+struct DohPrivateCertificate(rustls::crypto::WebPkiSupportedAlgorithms);
+
+impl rustls::client::danger::ServerCertVerifier for DohPrivateCertificate {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, signature, &self.0)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, signature, &self.0)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.supported_schemes()
     }
 }
 
@@ -683,6 +756,110 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn subscription_doh_uses_configured_tls_policy_authority_and_request_target() {
+        use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
+
+        let doh = url::Url::parse("https://192.0.2.1:8448/custom/private-token?type=test").unwrap();
+        let resolver = DnsResolver::new();
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(
+                &include_bytes!("../proxy/testdata/localhost-cert.der")[..],
+            )],
+            PrivatePkcs8KeyDer::from(&include_bytes!("../proxy/testdata/localhost-key.der")[..])
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+
+        for (server, expects_success) in [
+            (
+                DnsServer::UnverifiedDoh {
+                    url: doh.to_string(),
+                    bootstrap: vec![],
+                },
+                true,
+            ),
+            (
+                DnsServer::Endpoint {
+                    url: doh.to_string(),
+                    bootstrap: vec![],
+                    proxy: false,
+                },
+                false,
+            ),
+        ] {
+            assert!(!format!("{server:?}").contains("private-token"));
+            let (client, peer) = tokio::io::duplex(8192);
+            let (client, peer) = tokio::join!(
+                resolver
+                    .endpoint_tls_connector(&server)
+                    .connect(ServerName::try_from("192.0.2.1").unwrap(), client),
+                acceptor.accept(peer)
+            );
+            if !expects_success {
+                assert!(client.is_err());
+                continue;
+            }
+            let query = build_dns_query("node.example", QTYPE_A);
+            let reply = build_dns_response(&query, &["203.0.113.8".parse().unwrap()]).unwrap();
+            let peer = async {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut peer = BufReader::new(peer.unwrap());
+                let mut lines = vec![];
+                loop {
+                    let mut line = String::new();
+                    let n = peer.read_line(&mut line).await.unwrap();
+                    assert_ne!(n, 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                assert_eq!(
+                    lines[0],
+                    "POST /custom/private-token?type=test HTTP/1.1\r\n"
+                );
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.eq_ignore_ascii_case("host: 192.0.2.1:8448\r\n"))
+                );
+                let mut received = vec![0; query.len()];
+                peer.read_exact(&mut received).await.unwrap();
+                assert_eq!(received, query);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                    reply.len()
+                );
+                peer.write_all(response.as_bytes()).await.unwrap();
+                peer.write_all(&reply).await.unwrap();
+                peer.flush().await.unwrap();
+            };
+            let (response, ()) = tokio::join!(
+                exchange_https(Box::new(client.unwrap()), &doh, &query),
+                peer
+            );
+            assert_eq!(response.unwrap(), reply);
+        }
+
+        let server = DnsServer::UnverifiedDoh {
+            url: "tcp://192.0.2.1:53/private-token".into(),
+            bootstrap: vec![],
+        };
+        let err = resolver
+            .exchange_server(&server, &build_dns_query("node.example", QTYPE_A))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unverified DoH requires HTTPS");
+    }
 
     struct Dial {
         hosts: Arc<Mutex<Vec<String>>>,

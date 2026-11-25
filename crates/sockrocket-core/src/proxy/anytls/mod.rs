@@ -33,6 +33,7 @@ struct Client {
     server: String,
     port: u16,
     tls: TlsConfig,
+    ech_pin: (Option<crate::config::ech::EchSource>, Option<[u8; 32]>),
     connector: craft_tls::TlsConnector,
     password: [u8; 32],
     padding: Arc<Mutex<Padding>>,
@@ -71,7 +72,7 @@ impl AnyTlsOutbound {
             tls,
             keep_idle,
             &AnyTlsPool::default(),
-            None,
+            (None, None),
         )
     }
     pub(crate) fn new_pinned(
@@ -81,7 +82,7 @@ impl AnyTlsOutbound {
         tls: Option<&TlsConfig>,
         keep_idle: bool,
         pool: &AnyTlsPool,
-        pin: Option<[u8; 32]>,
+        ech_pin: (Option<crate::config::ech::EchSource>, Option<[u8; 32]>),
     ) -> Result<Self> {
         ensure!(
             !server.is_empty() && port != 0 && !password.is_empty(),
@@ -104,7 +105,8 @@ impl AnyTlsOutbound {
             client: Arc::new(Client {
                 server: server.into(),
                 port,
-                connector: transport::build_tls_connector_pinned(Some(&tls), pin),
+                connector: transport::build_tls_connector_pinned(Some(&tls), ech_pin.1),
+                ech_pin,
                 tls,
                 password: Sha256::digest(password.as_bytes()).into(),
                 padding: Arc::new(Mutex::new(Padding::default())),
@@ -266,15 +268,28 @@ impl Client {
             .clone()
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("AnyTLS global capacity reached"))?;
-        let mut raw = transport::connect_with_connector(
-            &self.server,
-            self.port,
-            &self.connector,
-            self.tls.sni.as_deref().unwrap_or(&self.server),
-            true,
-            Duration::from_secs(15),
-        )
-        .await?;
+        let sni = self.tls.sni.as_deref().unwrap_or(&self.server);
+        let mut raw = if let (Some(ech), pin) = &self.ech_pin {
+            ech.connect(
+                &self.server,
+                self.port,
+                sni,
+                self.tls.skip_cert_verify,
+                *pin,
+                self.tls.alpn.as_deref().unwrap_or_default(),
+            )
+            .await?
+        } else {
+            transport::connect_with_connector(
+                &self.server,
+                self.port,
+                &self.connector,
+                self.tls.sni.as_deref().unwrap_or(&self.server),
+                true,
+                Duration::from_secs(15),
+            )
+            .await?
+        };
         let pad = self
             .padding
             .lock()
@@ -897,10 +912,17 @@ mod tests {
             min_idle: 2,
             disable_reuse: false,
         };
-        let client =
-            AnyTlsOutbound::new_pinned("localhost", 443, "test", None, true, &options, None)
-                .unwrap()
-                .client;
+        let client = AnyTlsOutbound::new_pinned(
+            "localhost",
+            443,
+            "test",
+            None,
+            true,
+            &options,
+            (None, None),
+        )
+        .unwrap()
+        .client;
         assert_eq!(client.check_interval, Duration::from_secs(7));
         assert_eq!(client.idle_timeout, Duration::from_secs(9));
         for sequence in 1..=4 {
@@ -917,10 +939,17 @@ mod tests {
         assert_eq!(client.take_idle().unwrap().sequence, 3);
         assert!(client.take_idle().is_none());
         options.disable_reuse = true;
-        let client =
-            AnyTlsOutbound::new_pinned("localhost", 443, "test", None, true, &options, None)
-                .unwrap()
-                .client;
+        let client = AnyTlsOutbound::new_pinned(
+            "localhost",
+            443,
+            "test",
+            None,
+            true,
+            &options,
+            (None, None),
+        )
+        .unwrap()
+        .client;
         let (io, _) = tokio::io::duplex(64);
         client.recycle(session(Box::new(io)));
         assert!(client.take_idle().is_none());

@@ -107,7 +107,7 @@ async fn reference_anytls_tcp_udp_reuse_and_shutdown() {
             min_idle: 2,
             disable_reuse: false,
         },
-        None,
+        (None, None),
     )
     .unwrap();
     let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

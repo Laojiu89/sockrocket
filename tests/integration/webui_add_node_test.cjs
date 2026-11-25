@@ -81,3 +81,38 @@ assert.equal(ss.hysteria2, undefined);
 c.clearAddNodeSecrets();
 assert.equal(srElement('an-hy2-obfs-pass').value, '');
 console.log('PASS: manual HY2 fields, credentials, TLS, hopping, obfuscation and protocol switching');
+
+async function checkFileImport() {
+  const calls = [], results = [], refreshes = [];
+  const context = vm.createContext({
+    srElement, TextEncoder, TextDecoder,
+    srShowMsg: message => messages.push(message),
+    toastResp: result => results.push(result),
+    srRequestBodyLimit: () => 8 * 1024 * 1024,
+    srApi: (...args) => calls.push(args),
+    refreshNodeCatalogs: () => refreshes.push('nodes'), refreshStatus: () => refreshes.push('status')
+  });
+  vm.runInContext(page.slice(page.indexOf('async function importNodeFile'), page.indexOf('function delNode(i)')), context);
+  assert.match(page, /id="sr-node-file"[^>]*onchange="importNodeFile\(this\)"/);
+  const text = '[Proxy]\n测试 = trojan, example.invalid, 443, password=sample';
+  const file = new Blob([text]);
+  const input = {value: 'nodes.conf', files: [file]};
+  await context.importNodeFile(input);
+  assert.equal(input.value, '');
+  const [action, data, complete] = calls.shift();
+  assert.equal(action, 'import_nodes');
+  assert.equal(data.content, text);
+  assert.equal(srElement('node-import').disabled, true);
+  complete({ok: true, added: 1, msg: '已添加 1 个节点'});
+  assert.equal(srElement('node-import').disabled, false);
+  assert.deepEqual(refreshes, ['nodes', 'status']);
+  assert.equal(results.length, 1);
+  await context.importNodeFile({files: [file]});
+  calls.shift()[2]({ok: true, added: 0, updated: 1});
+  assert.deepEqual(refreshes, ['nodes', 'status', 'nodes', 'status']);
+  await context.importNodeFile({files: [new Blob([new Uint8Array([255])])]});
+  assert.equal(calls.length, 0);
+  assert.match(messages.pop(), /UTF-8/);
+  console.log('PASS: local UTF-8 node file upload, completion, and invalid encoding');
+}
+checkFileImport().catch(error => { console.error(error); process.exitCode = 1; });

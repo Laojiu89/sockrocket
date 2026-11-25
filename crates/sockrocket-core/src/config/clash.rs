@@ -104,7 +104,7 @@ struct ClashProxy {
     #[serde(rename = "private-key")]
     private_key: Option<String>,
     #[serde(rename = "ech-opts")]
-    ech_opts: Option<ClashSwitch>,
+    ech_opts: Option<super::ech::Options>,
     #[serde(rename = "realm-opts")]
     realm_opts: Option<ClashSwitch>,
     alpn: Option<Vec<String>>,
@@ -279,36 +279,7 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
             tracing::warn!("Skipping malformed proxy entry");
             continue;
         }
-        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("mieru") {
-            match mieru_from_clash(value) {
-                Ok(node) => nodes.push(node),
-                Err(_) => tracing::warn!("Skipping invalid or unsupported Mieru entry"),
-            }
-            continue;
-        }
-        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("wireguard") {
-            match super::wireguard::from_clash(&value) {
-                Ok(node) => nodes.push(node),
-                Err(_) => tracing::warn!("Skipping invalid or unsupported WireGuard entry"),
-            }
-            continue;
-        }
-        if value.get("type").and_then(serde_yaml::Value::as_str) == Some("tuic")
-            && normalize_tuic_endpoint(&mut value).is_err()
-        {
-            tracing::warn!("Skipping unsupported TUIC endpoint or TLS configuration");
-            continue;
-        }
-        // Per-entry deserialization: a single malformed proxy is skipped
-        // instead of failing the entire subscription.
-        let proxy: ClashProxy = match serde_yaml::from_value(value) {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::warn!("Skipping malformed proxy entry");
-                continue;
-            }
-        };
-        match convert_clash_proxy(&proxy) {
+        match parse_proxy_entry(value) {
             Ok(node) => nodes.push(node),
             Err(_) => {
                 tracing::warn!("Skipping unsupported or invalid proxy entry");
@@ -323,6 +294,35 @@ pub fn parse_clash_config(yaml_str: &str) -> Result<Vec<Node>> {
         }
     }
     Ok(nodes)
+}
+
+pub(super) fn parse_proxy_entry(mut value: serde_yaml::Value) -> Result<Node> {
+    match value.get("type").and_then(serde_yaml::Value::as_str) {
+        Some(kind @ ("mieru" | "wireguard")) => {
+            let ech = value
+                .get("ech-opts")
+                .cloned()
+                .map(serde_yaml::from_value::<super::ech::Options>)
+                .transpose()?;
+            let mut node = if kind == "mieru" {
+                mieru_from_clash(value)?
+            } else {
+                super::wireguard::from_clash(&value)?
+            };
+            if let Some(ech) = ech {
+                ech.attach(&mut node)?;
+            }
+            return Ok(node);
+        }
+        Some("tuic") => normalize_tuic_endpoint(&mut value)?,
+        _ => {}
+    }
+    let proxy: ClashProxy = serde_yaml::from_value(value)?;
+    let mut node = convert_clash_proxy(&proxy)?;
+    if let Some(ech) = proxy.ech_opts {
+        ech.attach(&mut node)?;
+    }
+    Ok(node)
 }
 
 fn normalize_tuic_endpoint(value: &mut serde_yaml::Value) -> Result<()> {
@@ -700,10 +700,6 @@ fn apply_tls_requirements(proxy: &ClashProxy, transport: &mut TransportConfig) -
     if transport.tls.is_none() && transport.reality.is_none() {
         return Ok(());
     }
-    anyhow::ensure!(
-        !proxy.ech_opts.as_ref().is_some_and(|o| o.enable),
-        "Encrypted ClientHello is unsupported"
-    );
     anyhow::ensure!(
         proxy.certificate.as_deref().unwrap_or("").is_empty()
             && proxy.private_key.as_deref().unwrap_or("").is_empty(),
@@ -1297,10 +1293,10 @@ proxies:
         let nodes = parse_clash_config(yaml).unwrap();
         assert_eq!(
             nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
-            ["checked", "defaults", "basic"]
+            ["ech", "checked", "defaults", "basic"]
         );
         assert!(
-            !nodes[0]
+            !nodes[1]
                 .transport
                 .as_ref()
                 .unwrap()
