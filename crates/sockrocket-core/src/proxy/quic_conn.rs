@@ -230,31 +230,40 @@ pub(super) fn build_quic_client_config_with_early_data(
     pin: Option<[u8; 32]>,
     early: bool,
 ) -> Result<quinn::ClientConfig> {
-    let mut rustls_config = if let Some(pin) = pin {
-        rustls::ClientConfig::builder()
+    let mut rustls_config = verified_client(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?,
+        skip_cert_verify,
+        pin,
+    );
+    rustls_config.enable_early_data = early;
+    rustls_config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
+    let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)?;
+    Ok(quinn::ClientConfig::new(Arc::new(crypto)))
+}
+
+pub(super) fn verified_client(
+    builder: rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>,
+    skip_cert_verify: bool,
+    pin: Option<[u8; 32]>,
+) -> rustls::ClientConfig {
+    if let Some(pin) = pin {
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedQuicVerifier(pin)))
             .with_no_client_auth()
     } else if skip_cert_verify {
-        rustls::ClientConfig::builder()
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureQuicVerifier))
             .with_no_client_auth()
     } else {
-        rustls::ClientConfig::builder()
+        builder
             .with_root_certificates(Arc::clone(&crate::TLS_ROOT_CERTIFICATES))
             .with_no_client_auth()
-    };
-
-    rustls_config.enable_early_data = early;
-    if !alpn.is_empty() {
-        rustls_config.alpn_protocols = alpn.iter().map(|s| s.as_bytes().to_vec()).collect();
     }
-
-    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(rustls_config)
-        .map_err(|e| anyhow::anyhow!("QUIC TLS config error: {}", e))?;
-
-    Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
 }
 
 pub(crate) fn prefer_socket_addrs(mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {

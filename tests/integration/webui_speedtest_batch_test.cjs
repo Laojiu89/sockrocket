@@ -21,9 +21,13 @@ const partial={state:'running',completed:1,total:2,results:[{key:'0-abc',latency
 requests.shift().ok({ok:true,job:partial});
 assert.equal(state.lat[0],10);
 assert.equal(state.testingAll,true);
-const finished={state:'finished',completed:2,total:2,results:[{key:'0-abc',latency:10},{key:'1-abc',latency:-1}]};
+const finished={state:'finished',completed:2,total:2,results:[{key:'0-abc',latency:10},{key:'1-abc',latency:-1,failure:'tls handshake failed'}]};
 timers.shift()();requests.shift().ok({ok:true,job:finished});
 assert.equal(state.lat[1],-1);assert.equal(state.testingAll,false);
+vm.runInContext(source.slice(source.indexOf('function latText('),source.indexOf('var srMsgTimer')),context);
+assert.equal(context.latText(state.lat[1],state.nodes[1]),'TLS 握手失败');
+assert.equal(context.latText(-1,{}),'测速失败'); // Older results have no cause.
+assert.equal(context.latText(-1,{probeFailure:'timeout'}),'超时');
 // A fresh page attaches by polling, never relaunches the batch.
 vm.runInContext(code+';pollSpeedTestJob();',context);
 assert.equal(requests[0].action,'speedtest_job');

@@ -471,6 +471,8 @@ body.bg {min-width:0!important}
           <button class="btn btn-accent btn-sm" id="sr-test-all-btn" onclick="testAllNodes()">快速测速</button>
           <button class="btn btn-sm" onclick="testAllNodes('http')">真实延迟</button>
           <button class="btn btn-sm" onclick="srLoadNodes()">刷新</button><button class="btn btn-sm" onclick="toggleAddNodeForm()">添加节点</button>
+          <button type="button" class="btn btn-sm" id="sr-node-import" onclick="srElement('node-file').click()">从配置文件导入节点</button>
+          <input type="file" id="sr-node-file" accept=".yaml,.yml,.json,.conf,.txt" hidden onchange="importNodeFile(this)">
           <div class="spacer"></div>
           <input type="search" id="sr-node-search" aria-label="搜索节点" placeholder="搜索名称或协议" oninput="renderNodes()"><span class="hint" id="sr-nodes-count"></span>
         </div>
@@ -1030,7 +1032,7 @@ function newRequestId() {
   return Array.from(bytes, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
 }
 function srRequestBodyLimit(action) {
-  if (action === 'save_config') return 8 * 1024 * 1024;
+  if (action === 'save_config' || action === 'import_nodes') return 8 * 1024 * 1024;
   if (action === 'batch_add_rules' || action === 'replace_rule_group') return 4 * 1024 * 1024;
   return 1024 * 1024;
 }
@@ -1181,7 +1183,17 @@ function srEsc(s) {
   });
 }
 function latClass(ms) { return ms < 0 ? 'bad' : ms < 200 ? 'good' : ms < 500 ? 'mid' : 'bad'; }
-function latText(ms) { return ms < 0 ? '超时' : ms + 'ms'; }
+function latText(ms, node) {
+  if (ms >= 0) return ms + 'ms';
+  switch (node && node.probeFailure) {
+    case 'invalid node': return '节点配置无效';
+    case 'timeout': return '超时';
+    case 'unreachable': return '节点不可达';
+    case 'tls handshake failed': return 'TLS 握手失败';
+    case 'protocol error': return '协议错误';
+    default: return '测速失败';
+  }
+}
 
 var srMsgTimer;
 function srShowMsg(msg, type) {
@@ -1228,7 +1240,7 @@ var SR_STATE = {
   status: {},        // status action result
   nodes: [],         // node_details
   subs: [],          // subscriptions (for copy-url by index)
-  lat: {},           // index -> ms (-1 = timeout)
+  lat: {},           // index -> ms (-1 = probe failure)
   testingAll: false,
 };
 var SR_PAGES = ['home', 'nodes', 'subs', 'dns', 'network', 'logs', 'config'];
@@ -1631,7 +1643,7 @@ function renderChrome() {
   nbName.textContent = SR_STATE.nodes[st.active_node] ? SR_STATE.nodes[st.active_node].name : (st.active_node != null ? '节点 #' + st.active_node : '—');
   var activeLat = SR_STATE.lat[st.active_node];
   var nbLat = srElement('nb-lat');
-  nbLat.textContent = activeLat != null ? latText(activeLat) : '';
+  nbLat.textContent = activeLat != null ? latText(activeLat, SR_STATE.nodes[st.active_node]) : '';
   nbLat.className = 'nb-lat' + (activeLat != null && activeLat < 0 ? ' bad' : '');
 
   // status bar
@@ -1641,7 +1653,7 @@ function renderChrome() {
   srElement('sb-state').className = running ? 'ok' : '';
   srElement('sb-node').textContent =
     (SR_STATE.nodes[st.active_node] ? SR_STATE.nodes[st.active_node].name : '') +
-    (activeLat != null ? ' · ' + latText(activeLat) : '');
+    (activeLat != null ? ' · ' + latText(activeLat, SR_STATE.nodes[st.active_node]) : '');
   srElement('sb-ports').textContent = 'SOCKS :' + (st.socks_port || 1080) + ' · HTTP :' + (st.http_port || 1087);
   srElement('sb-uptime').textContent = running && uptime && uptime !== 'stopped' ? '↑ ' + uptime : '';
   srElement('sb-nodes').textContent = st.node_count != null ? st.node_count + ' 个节点' : '—';
@@ -1888,7 +1900,7 @@ var savedSpeedTests = (function () {
 var speedTestsRestored = false;
 function saveSpeedTests() {
   savedSpeedTests.results = SR_STATE.nodes.map(function (n, i) {
-    return {key: nodeViewKey(n), latency: SR_STATE.lat[i]};
+    return {key: nodeViewKey(n), latency: SR_STATE.lat[i], failure: n.probeFailure};
   }).filter(function (entry) { return typeof entry.latency === 'number'; });
   try { sessionStorage.setItem('sr-speedtests-v1', JSON.stringify(savedSpeedTests)); }
   catch (e) { /* Measurement still works if browser storage is unavailable. */ }
@@ -1922,10 +1934,13 @@ function srLoadNodes() {
     if (d.ok === false || !Array.isArray(d.nodes)) { failed(d); return; }
     nodeLoadError = '';
     var previous = Object.create(null);
-    (savedSpeedTests.results || []).forEach(function (entry) { previous[entry.key] = entry.latency; });
-    SR_STATE.nodes.forEach(function (n,i) { if (SR_STATE.lat[i] != null) previous[nodeViewKey(n)] = SR_STATE.lat[i]; });
+    (savedSpeedTests.results || []).forEach(function (entry) { previous[entry.key] = entry; });
+    SR_STATE.nodes.forEach(function (n,i) { if (SR_STATE.lat[i] != null) previous[nodeViewKey(n)] = {latency: SR_STATE.lat[i], failure: n.probeFailure}; });
     SR_STATE.nodes = d.nodes; SR_STATE.lat = {};
-    SR_STATE.nodes.forEach(function(n,i) { var key = nodeViewKey(n); if (previous[key] != null) SR_STATE.lat[i] = previous[key]; });
+    SR_STATE.nodes.forEach(function(n,i) {
+      var saved = previous[nodeViewKey(n)];
+      if (saved) { SR_STATE.lat[i] = saved.latency; n.probeFailure = saved.failure; }
+    });
     if (!speedTestsRestored) {
       speedTestsRestored = true;
       // The backend owns running work and cached results, including after reload.
@@ -1955,7 +1970,7 @@ function renderNodes() {
       '<span class="badge">' + srEsc(n.protocol || '?') + '</span>' +
       '<button class="r-name node-inspect" onclick="inspectNode(' + i + ')">' + srEsc(n.name) + '</button>' +
       '<span class="r-sub">' + (i === activeIdx ? '使用中' : '') + '</span>' +
-      '<span class="lat ' + (lat != null ? latClass(lat) : '') + '" id="sr-lat-' + i + '">' + (lat != null ? latText(lat) : '—') + '</span>' +
+      '<span class="lat ' + (lat != null ? latClass(lat) : '') + '" id="sr-lat-' + i + '">' + (lat != null ? latText(lat, n) : '—') + '</span>' +
       '<button class="btn btn-sm" onclick="inspectNode(' + i + ')">详情</button>' +
       '<button class="btn btn-sm" onclick="event.stopPropagation();testNode(' + i + ')">测速</button>' +
       '<button class="btn btn-accent btn-sm"' + (i === activeIdx || nodeSwitchPending ? ' disabled' : '') + ' onclick="setNode(' + i + ')">' + (i === activeIdx ? '使用中' : '使用') + '</button>' +
@@ -1973,7 +1988,7 @@ function inspectNode(i) {
   srElement('detail-protocol').textContent = n.protocol || '未知';
   srElement('detail-endpoint').textContent = '已隐藏';
   srElement('detail-reveal').checked = false;
-  srElement('detail-latency').textContent = SR_STATE.lat[i] == null ? '未测速' : latText(SR_STATE.lat[i]);
+  srElement('detail-latency').textContent = SR_STATE.lat[i] == null ? '未测速' : latText(SR_STATE.lat[i], n);
   srElement('detail-connect').disabled = i === Number(SR_STATE.status.active_node);
   srElement('node-dialog').showModal();
 }
@@ -2004,15 +2019,16 @@ function testNode(i) {
   var key = nodeViewKey(SR_STATE.nodes[i]);
   var el = srElement('lat-' + i);
   if (el) el.textContent = '…';
-  // Warm through-proxy probe (warmup + measure). Cap wait for Reality/QUIC.
+  // Per-node buttons use the same protocol-aware probe as the quick batch.
   function finish(d) {
     if (!SR_STATE.nodes[i] || nodeViewKey(SR_STATE.nodes[i]) !== key) return;
     SR_STATE.lat[i] = d && d.ok && d.latency >= 0 ? d.latency : -1;
+    SR_STATE.nodes[i].probeFailure = d && d.failure;
     saveSpeedTests();
     renderNodes();
     renderChrome();
   }
-  srApi('speedtest_node', { index: i }, finish, function () { finish(); }, 60000);
+  srApi('speedtest_node', { index: i }, finish, function () { renderNodes(); }, 60000);
 }
 var speedTestPollPending = false;
 var speedTestPollTimer = null;
@@ -2021,7 +2037,10 @@ function applySpeedTestJob(job) {
   SR_STATE.nodes.forEach(function (node, i) { indices[nodeViewKey(node)] = i; });
   (job.results || []).forEach(function (result) {
     var index = indices[result.key];
-    if (index != null) SR_STATE.lat[index] = result.latency;
+    if (index != null) {
+      SR_STATE.lat[index] = result.latency;
+      SR_STATE.nodes[index].probeFailure = result.failure;
+    }
   });
   SR_STATE.testingAll = job.state === 'running';
   var btn = srElement('test-all-btn');
@@ -2154,6 +2173,34 @@ function submitNode(data, onSaved) {
     pending(false);
     srShowMsg((d && (d.msg || d.error_message)) || '未能确认添加结果，请刷新节点列表后核对。', 'err');
   });
+}
+async function importNodeFile(input) {
+  var file = input.files[0], button = srElement('node-import');
+  input.value = '';
+  if (!file || button.disabled) return;
+  var limit = srRequestBodyLimit('import_nodes');
+  if (file.size > limit) { srShowMsg('节点文件超过 8 MiB，请拆分后导入。', 'err'); return; }
+  button.disabled = true;
+  try {
+    var content = new TextDecoder('utf-8', {fatal:true}).decode(await file.arrayBuffer());
+    var data = {content:content};
+    if (new TextEncoder().encode(JSON.stringify(data)).length > limit) {
+      button.disabled = false;
+      srShowMsg('编码后的导入请求超过 8 MiB，请拆分文件。', 'err');
+      return;
+    }
+    srApi('import_nodes', data, function (result) {
+      button.disabled = false;
+      toastResp(result);
+      if (result.ok && (result.added || result.updated)) { refreshNodeCatalogs(); refreshStatus(); }
+    }, function () {
+      button.disabled = false;
+      srShowMsg('未能确认导入结果，请刷新节点列表后核对。', 'err');
+    }, 60000);
+  } catch (error) {
+    button.disabled = false;
+    srShowMsg('无法读取文件，请选择 UTF-8 编码的节点配置。', 'err');
+  }
 }
 function delNode(i) {
   var node = SR_STATE.nodes[i];

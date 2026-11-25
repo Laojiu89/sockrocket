@@ -28,3 +28,6 @@ libc = "0.2"
 [target.'cfg(all(target_os = "linux", target_env = "musl"))'.dependencies]
 # Use the compact float formatting tables for the Merlin CLI's YAML output.
 ryu = { version = "1", features = ["small"] }
+
+[target.'cfg(all(target_arch = "arm", target_env = "musl", target_abi = "eabi"))'.dependencies]
+libm = "0.2"

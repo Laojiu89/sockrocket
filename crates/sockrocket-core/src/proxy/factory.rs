@@ -83,6 +83,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             || matches!(node.protocol, ProxyProtocol::VLess { .. }),
         "XHTTP is currently supported only for VLESS"
     );
+    let ech = crate::config::ech::EchSource::from_node(node)?;
     match &node.protocol {
         ProxyProtocol::Mieru { username, password } => {
             anyhow::ensure!(
@@ -128,10 +129,13 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                     node.transport.as_ref().and_then(|t| t.tls.as_ref()),
                     warm_pool,
                     pool,
-                    node.extra
-                        .get(crate::config::v2ray::TLS_CERT_PIN)
-                        .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
-                        .transpose()?,
+                    (
+                        ech,
+                        node.extra
+                            .get(crate::config::v2ray::TLS_CERT_PIN)
+                            .map(|p| crate::config::v2ray::parse_tuic_certificate_pin(p))
+                            .transpose()?,
+                    ),
                 )?,
             )))
         }
@@ -229,23 +233,15 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
             alter_id,
             ..
         } => {
-            let mut out = if warm_pool {
-                VMessOutbound::new(
-                    &node.server,
-                    node.port,
-                    uuid,
-                    cipher,
-                    node.transport.as_ref(),
-                )?
-            } else {
-                VMessOutbound::new_unwarmed(
-                    &node.server,
-                    node.port,
-                    uuid,
-                    cipher,
-                    node.transport.as_ref(),
-                )?
-            };
+            let mut out = VMessOutbound::build(
+                &node.server,
+                node.port,
+                uuid,
+                cipher,
+                node.transport.as_ref(),
+                warm_pool,
+                ech,
+            )?;
             out.set_alter_id(*alter_id)?;
             out.framing = super::vmess::Framing {
                 padding: node
@@ -309,6 +305,7 @@ fn build_outbound_inner(node: &Node, warm_pool: bool) -> Result<SharedOutbound> 
                 tls_config,
                 &node.extra,
             )?;
+            out.ech = ech;
             out.configure_socket(obfs.as_ref(), &node.extra)?;
             Ok(SharedOutbound(Arc::new(out)))
         }

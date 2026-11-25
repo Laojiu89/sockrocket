@@ -102,6 +102,7 @@ pub fn export_v2ray_base64(nodes: &[Node]) -> String {
     let lines = nodes
         .iter()
         .map(node_to_share_uri)
+        .filter(|uri| !uri.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
     general_purpose::STANDARD.encode(lines.as_bytes())
@@ -498,6 +499,14 @@ fn node_to_clash_mapping(node: &Node, name: &str) -> Option<Mapping> {
         }
     }
 
+    if node.extra.contains_key(super::ech::KEY) {
+        use super::ech::EchSource;
+        let ech = match EchSource::from_node(node).ok()?? {
+            EchSource::Inline(config) => serde_json::json!({"enable":true, "config":config}),
+            EchSource::Dns(name) => serde_json::json!({"enable":true, "query-server-name":name}),
+        };
+        put(&mut m, "ech-opts", serde_yaml::to_value(ech).ok()?);
+    }
     Some(m)
 }
 

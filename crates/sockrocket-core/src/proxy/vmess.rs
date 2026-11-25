@@ -96,36 +96,44 @@ impl VMessOutbound {
         cipher: &str,
         transport: Option<&TransportConfig>,
     ) -> Result<Self> {
-        Self::build(server, port, uuid_str, cipher, transport, true)
+        Self::build(server, port, uuid_str, cipher, transport, true, None)
     }
 
-    /// Probe/latency variant: the connection pool never warms in the
-    /// background, so a one-shot latency test doesn't pre-connect a full
-    /// pool of TLS handshakes at the server.
-    pub(crate) fn new_unwarmed(
-        server: &str,
-        port: u16,
-        uuid_str: &str,
-        cipher: &str,
-        transport: Option<&TransportConfig>,
-    ) -> Result<Self> {
-        Self::build(server, port, uuid_str, cipher, transport, false)
-    }
-
-    fn build(
+    pub(super) fn build(
         server: &str,
         port: u16,
         uuid_str: &str,
         cipher: &str,
         transport: Option<&TransportConfig>,
         warm_pool: bool,
+        ech: Option<crate::config::ech::EchSource>,
     ) -> Result<Self> {
         let parsed_uuid = uuid::Uuid::parse_str(uuid_str)?;
         let security = VMessSecurity::from_str(cipher)?;
 
-        let factory = Arc::new(TlsConnFactory::from_transport(
-            server, port, transport, false,
-        ));
+        let mut factory = TlsConnFactory::from_transport(server, port, transport, false);
+        if let Some(ech) = ech {
+            let tls = transport
+                .and_then(|t| t.tls.as_ref())
+                .context("ECH requires VMess TLS")?;
+            let mut alpn = tls.alpn.clone().unwrap_or_default();
+            if transport
+                .is_some_and(|t| t.transport_type == crate::config::model::TransportType::Grpc)
+            {
+                alpn = vec!["h2".into()];
+            } else if transport.is_some_and(|t| {
+                matches!(
+                    t.transport_type,
+                    crate::config::model::TransportType::WebSocket
+                        | crate::config::model::TransportType::HttpUpgrade
+                )
+            }) && alpn.is_empty()
+            {
+                alpn.push("http/1.1".into());
+            }
+            factory.ech = Some((ech, tls.skip_cert_verify, alpn));
+        }
+        let factory = Arc::new(factory);
         let pool = if warm_pool {
             ConnPool::new(factory)
         } else {

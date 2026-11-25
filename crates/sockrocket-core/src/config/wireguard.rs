@@ -165,6 +165,12 @@ fn clash_entry(v: &Value) -> Result<Node> {
     )
 }
 pub(crate) fn from_singbox(v: &Value) -> Result<Node> {
+    if let Some(ech) = v.pointer("/tls/ech") {
+        ensure!(
+            ech.get("enabled").and_then(Value::as_bool) == Some(false),
+            "WireGuard does not support ECH"
+        );
+    }
     ensure!(
         !v.get("system")
             .or_else(|| v.get("system_interface"))

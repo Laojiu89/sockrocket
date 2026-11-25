@@ -12,6 +12,10 @@ Transparent proxy integration for **AsusWRT-Merlin** routers.
 
 在软件中心安装对应型号的离线包后，导入订阅或节点，选择出口并启动。新安装使用规则模式时，「全局设备」已关联内网直连、GEO 直连和 CN 直连。未匹配流量通过「全局设备兜底」走当前选中的全局节点。切换节点后兜底自动跟随。需要例外时，可在「分流规则」中创建规则组或添加预设，再绑定到全局或具体设备。预设现有 20 组，覆盖 AI、视频、音乐、游戏、开发工具、国内网站与 Emby。支持按规则组从 HTTP(S) 链接读取规则、预览并追加。
 
+在「节点 → 从配置文件导入节点」选择 UTF-8 编码的 Clash YAML、sing-box JSON 或 Shadowrocket CONF 文件。插件提取文件中定义的节点，按连接参数去重，并显示新增、更新、重复和跳过的数量。Shadowrocket 配置需包含带节点定义的 `[Proxy]` 段。
+
+AnyTLS、Hysteria2 和 VMess TLS 节点支持 X25519 ECH，可读取内置 ECHConfigList 或通过已配置的引导 DNS 查询 HTTPS 记录。Shadowrocket 的 `[Proxy]` 节点可使用 `ech=true`、查询域名或 Base64 配置。启用 ECH 时使用原生 TLS 1.3 握手；获取配置或协商失败会终止连接。如果服务商为入口域名指定了专用 DNS，请保留包含解析器定义的原始配置。先导入了纯节点文件时，再导入完整的 sing-box JSON 可为匹配的本地节点补齐 DNS，保留节点名称和分组。
+
 设备可关联多个组，每条绑定独立指定优先级和出口。删除设备配置会清理该来源的绑定、专属规则、默认出口和自定义名称，在线设备仍可从固件的 DHCP 和邻居表重新发现。使用「检查分流」核对当前设备命中的规则与出口。
 
 下文保留安装包布局和固件集成说明，供手动安装与排障使用。
@@ -134,7 +138,7 @@ Hysteria2 share links support `security=tls`, `sni`, `insecure`, `alpn`, `pinSHA
 
 AnyTLS accepts `security=tls` and SHA-256 certificate pins through `pcs` or `pinSHA256`. A pin always checks the leaf certificate, including when `insecure=1`; a mismatch fails closed. Pins, Hysteria2 bandwidth and Fast Open settings survive saved configuration, share-link and Clash export/import. Conflicting pins and malformed parameters are rejected. Hysteria2 supports Salamander, Gecko and UDP destination port hopping.
 
-sing-box TLS settings that cannot yet be enforced, including `certificate_public_key_sha256` (SPKI pins), custom trust certificates, client certificates, ECH and version constraints, cause the node to be rejected. They are never silently dropped, including with `insecure=true`. This differs from the supported leaf-certificate pins in URI/Clash imports.
+sing-box TLS settings that cannot yet be enforced, including `certificate_public_key_sha256` (SPKI pins), custom trust certificates, client certificates and version constraints, cause the node to be rejected. They are never silently dropped, including with `insecure=true`. This differs from the supported leaf-certificate pins in URI/Clash imports.
 
 VLESS `xtls-rprx-vision` runs natively over TLS 1.3 or REALITY/TCP, including Vision padding and independent read/write raw-copy transitions. Non-HTTPS UDP uses XUDP through the Vision connection; the standard flow rejects UDP/443 to permit client TCP fallback. Unknown flows and Vision over WebSocket are rejected. The reference interoperability test covers ordinary TCP, TLS 1.3 data transfer, half-close and UDP without changing host routes.
 

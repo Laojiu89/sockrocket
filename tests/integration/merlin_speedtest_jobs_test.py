@@ -48,5 +48,7 @@ with tempfile.TemporaryDirectory(prefix='sockrocket-speedtest-fixture-') as tmp:
     details=api('node_details')['nodes']
     assert by_key[details[0]['test_id']]==-1
     assert by_key[details[1]['test_id']]>=0
+    bad_result=next(r for r in mixed['results'] if r['key']==details[0]['test_id'])
+    assert bad_result['failure']=='invalid node',bad_result
     listener.close()
 print('PASS: 128 duplicate nodes all tested, detached lifetime, cached results, idempotent launch')

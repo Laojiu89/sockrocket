@@ -17,7 +17,9 @@ mod policy_tests;
 mod wire_dedup_tests;
 pub use listener::check_listener as check_dns_listener;
 pub(crate) use listener::serve_tcp_dns_client;
+mod ech;
 mod runtime;
+pub(crate) use ech::resolve_ech;
 mod upstream;
 pub use runtime::configure_bootstrap;
 pub(crate) use runtime::{
@@ -146,7 +148,7 @@ pub enum DnsGroup {
 }
 
 /// DNS server types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum DnsServer {
     /// Standard UDP DNS
     Udp(SocketAddr),
@@ -156,6 +158,11 @@ pub enum DnsServer {
     Endpoint {
         url: String,
         proxy: bool,
+        bootstrap: Vec<SocketAddr>,
+    },
+    /// Direct HTTPS endpoint explicitly configured to accept a private certificate.
+    UnverifiedDoh {
+        url: String,
         bootstrap: Vec<SocketAddr>,
     },
     /// DNS-over-HTTPS (e.g., "https://dns.google/dns-query")
@@ -176,6 +183,31 @@ pub enum DnsServer {
     /// hijacked without a valid certificate for the SNI, so the exit can
     /// only block it outright — never silently poison it.
     ProxyTls(SocketAddr, String),
+}
+
+// DoH paths and query strings may contain subscription credentials.
+impl std::fmt::Debug for DnsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Udp(addr) => f.debug_tuple("Udp").field(addr).finish(),
+            Self::Tcp(addr) => f.debug_tuple("Tcp").field(addr).finish(),
+            Self::Tls(addr, sni) => f.debug_tuple("Tls").field(addr).field(sni).finish(),
+            Self::ProxyTcp(addr) => f.debug_tuple("ProxyTcp").field(addr).finish(),
+            Self::ProxyTls(addr, sni) => f.debug_tuple("ProxyTls").field(addr).field(sni).finish(),
+            Self::DoH(_) => f.write_str("DoH"),
+            Self::Endpoint {
+                proxy, bootstrap, ..
+            } => f
+                .debug_struct("Endpoint")
+                .field("proxy", proxy)
+                .field("bootstrap", bootstrap)
+                .finish_non_exhaustive(),
+            Self::UnverifiedDoh { bootstrap, .. } => f
+                .debug_struct("UnverifiedDoh")
+                .field("bootstrap", bootstrap)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// DNS query type for A (IPv4) records.

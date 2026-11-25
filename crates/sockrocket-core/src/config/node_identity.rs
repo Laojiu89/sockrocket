@@ -27,6 +27,7 @@ pub(super) fn fingerprint(node: &Node) -> String {
         }
     }
     let extra = [
+        super::ech::KEY,
         super::ss_plugin::KEY,
         super::v2ray::VLESS_ENCRYPTION,
         super::v2ray::TLS_CERT_PIN,
@@ -118,10 +119,9 @@ pub(super) fn rule_target_migrations(members: &HashMap<String, String>) -> HashM
         .collect()
 }
 
-pub(super) fn remap_references(
-    map: &mut serde_yaml::Mapping,
-    members: &HashMap<String, String>,
-) -> bool {
+/// Preserve group selections and direct node rule targets when a node's
+/// connection fingerprint changes during an import.
+pub fn remap_references(map: &mut serde_yaml::Mapping, members: &HashMap<String, String>) -> bool {
     if members.is_empty() {
         return false;
     }

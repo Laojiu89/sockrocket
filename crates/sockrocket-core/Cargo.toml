@@ -34,6 +34,7 @@ rand = { workspace = true }
 lru = { workspace = true }
 socket2 = { workspace = true }
 rustls = { workspace = true }
+hpke = { version = "0.12", default-features = false, features = ["x25519", "alloc"] }
 tokio-rustls = { workspace = true }
 craft-tls = { workspace = true }
 craftls = { package = "rustls", version = "0.22.4", default-features = false, features = ["lazy-fingerprint-sets"] }
