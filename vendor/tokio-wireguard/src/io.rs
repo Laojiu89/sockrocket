@@ -26,17 +26,12 @@ pub struct IO<E: Evented> {
 }
 
 impl<E: Evented> IO<E> {
-    pub fn new(interface: Interface, evented: E, allocation: Option<Allocation>) -> Self {
+    pub fn new(interface: Interface, evented: E, allocation: Option<Arc<AllocationGuard>>) -> Self {
         let (wake, wakers) = wakers();
         Self {
-            interface: interface.clone(),
+            interface,
             evented: Arc::new(Mutex::new(Some(evented))),
-            allocation: allocation.map(|allocation| {
-                Arc::new(AllocationGuard {
-                    allocations: interface.allocations.clone(),
-                    allocation,
-                })
-            }),
+            allocation,
             wake,
             wakers,
         }
@@ -215,6 +210,20 @@ impl<E: Evented> DerefMut for IO<E> {
 pub(crate) struct AllocationGuard {
     allocations: Allocations,
     allocation: Allocation,
+    _recv_credit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+impl AllocationGuard {
+    pub(crate) fn new(
+        interface: &Interface,
+        allocation: Allocation,
+        recv_credit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            allocations: interface.allocations.clone(),
+            allocation,
+            _recv_credit: recv_credit,
+        })
+    }
 }
 impl std::fmt::Debug for AllocationGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

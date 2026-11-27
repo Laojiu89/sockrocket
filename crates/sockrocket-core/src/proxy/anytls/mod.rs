@@ -520,9 +520,14 @@ impl Session {
                 if self.content.len().saturating_sub(self.content_pos) + data.len() > 65535 {
                     return Err(invalid("AnyTLS early data limit exceeded"));
                 }
-                self.content.drain(..self.content_pos);
+                if self.content_pos == self.content.len() {
+                    // Steady-state download: hand the completed frame to the reader.
+                    self.content = data;
+                } else {
+                    self.content.drain(..self.content_pos);
+                    self.content.extend(data);
+                }
                 self.content_pos = 0;
-                self.content.extend(data);
             }
             3 if id == self.id && data.is_empty() => self.peer_finished = true,
             7 if id == self.id => {
@@ -805,6 +810,24 @@ mod tests {
         let (cmd, id, body) = std::future::poll_fn(|cx| s.poll_frame(cx)).await.unwrap();
         assert_eq!((cmd, id, body), (2, 1, b"preserved".to_vec()));
     }
+    #[tokio::test]
+    async fn download_frames_preserve_unread_early_data_and_handoff() {
+        let (a, _) = tokio::io::duplex(128);
+        let mut s = session(Box::new(a));
+        s.apply(2, 1, b"first".to_vec()).unwrap();
+        s.content_pos = 3;
+        s.apply(2, 1, b"second".to_vec()).unwrap();
+        assert_eq!(&s.content[s.content_pos..], b"stsecond");
+        assert!(s.apply(2, 1, vec![0; 65535]).is_err());
+        s.content_pos = s.content.len();
+        let frame = vec![42; 65535];
+        let storage = frame.as_ptr();
+        s.apply(2, 1, frame).unwrap();
+        assert_eq!(s.content.as_ptr(), storage);
+        assert_eq!(s.content_pos, 0);
+        assert_eq!(s.content.len(), 65535);
+    }
+
     #[test]
     fn errors_and_old_streams_never_become_new_stream_payload() {
         let (a, _) = tokio::io::duplex(128);

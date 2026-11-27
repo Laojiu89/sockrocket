@@ -157,6 +157,7 @@ enum Shared {
     H2 {
         sender: h2::client::SendRequest<Bytes>,
         _driver: Task,
+        _download_window: Option<tokio::sync::SemaphorePermit<'static>>,
     },
     H3 {
         sender: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
@@ -212,9 +213,8 @@ impl Client {
             Version::H2 => {
                 let io = raw.create().await?;
                 let mut b = h2::client::Builder::new();
+                let download_window = crate::proxy::h2_stream::configure_download_window(&mut b);
                 b.enable_push(false)
-                    .initial_window_size(65535)
-                    .initial_connection_window_size(65535)
                     .max_header_list_size(128 * 1024)
                     .max_send_buffer_size(16384);
                 let (sender, mut connection) = tokio::time::timeout(TIMEOUT, b.handshake(io))
@@ -250,6 +250,7 @@ impl Client {
                 Shared::H2 {
                     sender,
                     _driver: driver,
+                    _download_window: download_window,
                 }
             }
             Version::H3 => {
@@ -273,7 +274,12 @@ impl Client {
                 };
                 static QUIC_BUDGET: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
                     std::sync::OnceLock::new();
-                let reservation = if chrome { 17 * 1024 * 1024 } else { 256 * 1024 };
+                const RECEIVE_WINDOW: u32 = 256 * 1024;
+                let reservation = if chrome {
+                    17 * 1024 * 1024
+                } else {
+                    RECEIVE_WINDOW
+                };
                 let credit = QUIC_BUDGET
                     .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(96 * 1024 * 1024)))
                     .clone()
@@ -301,8 +307,8 @@ impl Client {
                         crate::proxy::quic_fingerprint::transport_config(&mut transport);
                     } else {
                         transport
-                            .receive_window(262144u32.into())
-                            .stream_receive_window(65535u32.into())
+                            .receive_window(RECEIVE_WINDOW.into())
+                            .stream_receive_window(RECEIVE_WINDOW.into())
                             .max_idle_timeout(Some(Duration::from_secs(90).try_into()?));
                     }
                     transport.send_window(262144);

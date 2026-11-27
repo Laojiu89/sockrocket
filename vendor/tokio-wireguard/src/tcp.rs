@@ -61,13 +61,15 @@ impl TcpStream {
                 continue;
             };
 
+            let (recv_size, credit) = interface.options().tcp.outbound_recv_buffer();
+            let lease = crate::io::AllocationGuard::new(&interface, allocation, credit);
             let socket = IO::new(
                 interface.clone(),
                 Socket::new(
-                    SocketBuffer::new(vec![0; interface.options().tcp.recv_buffer_size]),
+                    SocketBuffer::new(vec![0; recv_size]),
                     SocketBuffer::new(vec![0; interface.options().tcp.send_buffer_size]),
                 ),
-                Some(allocation),
+                Some(lease),
             );
 
             if socket
@@ -773,5 +775,67 @@ impl Evented for Socket<'static> {
 
     fn register_write_waker(&mut self, waker: &Waker) {
         self.register_send_waker(waker)
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+    use crate::interface::TcpOptions;
+    use smoltcp::{
+        iface::{Config, Interface as Stack, SocketSet},
+        phy::{Loopback, Medium},
+        time::Instant,
+        wire::{HardwareAddress, IpAddress, IpCidr},
+    };
+
+    fn buffered_download(recv_size: usize, payload: &[u8]) -> usize {
+        let mut device = Loopback::new(Medium::Ip);
+        let mut stack = Stack::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
+        let address = IpAddress::v4(127, 0, 0, 1);
+        stack.update_ip_addrs(|ips| ips.push(IpCidr::new(address, 8)).unwrap());
+        let socket = |rx, tx| {
+            Socket::new(
+                SocketBuffer::new(vec![0; rx]),
+                SocketBuffer::new(vec![0; tx]),
+            )
+        };
+        let mut sockets = SocketSet::new(Vec::new());
+        let server = sockets.add(socket(4096, payload.len()));
+        let client = sockets.add(socket(recv_size, 4096));
+        sockets.get_mut::<Socket>(server).listen(443).unwrap();
+        sockets
+            .get_mut::<Socket>(client)
+            .connect(stack.context(), (address, 443), 50000)
+            .unwrap();
+        let mut submitted = false;
+        for tick in 0..2000 {
+            stack.poll(Instant::from_millis(tick), &mut device, &mut sockets);
+            let sender = sockets.get_mut::<Socket>(server);
+            if !submitted && sender.can_send() {
+                assert_eq!(sender.send_slice(payload).unwrap(), payload.len());
+                submitted = true;
+            }
+        }
+        let receiver = sockets.get_mut::<Socket>(client);
+        let mut received = vec![0; receiver.recv_queue()];
+        assert_eq!(receiver.recv_slice(&mut received).unwrap(), received.len());
+        assert_eq!(received, payload[..received.len()]);
+        received.len()
+    }
+
+    #[test]
+    fn outbound_tcp_uses_large_window_only_while_credit_is_available() {
+        let mut opts = TcpOptions::default();
+        opts.recv_buffer_size = 32 * 1024;
+        opts.large_recv_buffer = Some((512 * 1024, Arc::new(tokio::sync::Semaphore::new(1))));
+        let (large, credit) = opts.outbound_recv_buffer();
+        let (ordinary, fallback) = opts.outbound_recv_buffer();
+        assert!(credit.is_some() && fallback.is_none());
+        let payload: Vec<_> = (0..480 * 1024).map(|i| (i % 251) as u8).collect();
+        assert_eq!(buffered_download(large, &payload), payload.len());
+        assert_eq!(buffered_download(ordinary, &payload), opts.recv_buffer_size);
+        drop(credit);
+        assert!(opts.outbound_recv_buffer().1.is_some());
     }
 }

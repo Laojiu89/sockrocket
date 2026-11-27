@@ -166,3 +166,74 @@ impl Encoder<&[u8]> for Hunks {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_download_over_delayed_window_updates() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let (client, uplink) = tokio::io::duplex(128 * 1024);
+        let (downlink, server) = tokio::io::duplex(128 * 1024);
+        let (up_read, mut up_write) = tokio::io::split(uplink);
+        let (mut down_read, mut down_write) = tokio::io::split(downlink);
+        // Deliver client feedback (including WINDOW_UPDATE) in 80 ms rounds.
+        // Downstream DATA has no artificial rate limit.
+        tokio::spawn(async move {
+            let mut up_read = tokio::io::BufReader::new(up_read);
+            while !up_read.fill_buf().await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let feedback = up_read.buffer();
+                down_write.write_all(feedback).await.unwrap();
+                let n = feedback.len();
+                up_read.consume(n);
+            }
+        });
+        tokio::spawn(async move { tokio::io::copy(&mut down_read, &mut up_write).await });
+        let payload = Bytes::from(
+            (0..4 * 1024 * 1024)
+                .map(|i| (i % 251) as u8)
+                .collect::<Vec<_>>(),
+        );
+        let expected = payload.clone();
+        let server = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            let (_request, mut respond) = conn.accept().await.unwrap().unwrap();
+            let response = http::Response::builder()
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let mut send = respond.send_response(response, false).unwrap();
+            let mut frames = BytesMut::new();
+            Hunks::default().encode(&payload, &mut frames).unwrap();
+            send.send_data(frames.freeze(), true).unwrap();
+            while conn.accept().await.is_some() {}
+        });
+        let mut tunnel = connect(
+            Box::new(client),
+            "example.invalid",
+            false,
+            &GrpcConfig::default(),
+        )
+        .await
+        .unwrap();
+        let start = tokio::time::Instant::now();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(12), tunnel.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..], expected.as_ref());
+        let elapsed = start.elapsed();
+        eprintln!("4 MiB with delayed HTTP/2 feedback: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "4 MiB response took {elapsed:?}"
+        );
+        drop(tunnel);
+        server.abort();
+    }
+}

@@ -11,7 +11,7 @@ impl ResourceBudget {
         // Leave room for ordinary multi-device LAN concurrency. The previous
         // 128/256/512 caps could reject new flows while ample memory remained.
         // Smaller relay buffers bound aggregate copy memory as admission grows.
-        // TUN copies reserve 8 KiB per flow; retained receive/send
+        // TUN copies start at 8 KiB per flow, with bounded larger download buffers; retained receive/send
         // payload has a separate shared cap. DNS has its own admission quota.
         if total <= 300 * 1024 {
             Self {
@@ -73,6 +73,11 @@ fn relay_buffer_for(memory_kib: u64) -> usize {
         307_201..=614_400 => 8 * 1024,
         _ => 16 * 1024,
     }
+}
+
+/// Each transport can grant one larger download window per 64 MiB of device RAM.
+pub(crate) fn large_download_window_slots() -> usize {
+    (detected_memory_kib() / (64 * 1024)).clamp(1, 32) as usize
 }
 
 pub(crate) fn connection_pool_limits() -> (usize, usize, usize) {
@@ -142,7 +147,11 @@ mod tests {
             let budget = ResourceBudget::for_memory_kib(memory * 1024);
             assert_eq!(budget.tun_streams, streams);
             let shared_payload_kib = tun_tcp_payload_budget_for(memory * 1024) as u64 / 1024;
-            assert!(budget.tun_streams as u64 * 8 + shared_payload_kib < memory * 1024 / 8);
+            let extra_download_kib = (streams / 8) as u64 * (16 - 4);
+            assert!(
+                budget.tun_streams as u64 * 8 + extra_download_kib + shared_payload_kib
+                    < memory * 1024 / 8
+            );
             assert!(budget.dns_queries <= budget.tun_streams);
             assert!(budget.api_requests <= 6);
         }

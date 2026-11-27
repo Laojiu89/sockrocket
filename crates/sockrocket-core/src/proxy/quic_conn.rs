@@ -9,6 +9,14 @@ use std::sync::{Arc, Once};
 
 use anyhow::Result;
 
+/// Native proxy streams share a connection-wide receive budget. A single
+/// download can use up to a quarter of it before waiting for more credit.
+pub(super) fn proxy_receive_windows(transport: &mut quinn::TransportConfig) {
+    transport
+        .receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024))
+        .stream_receive_window(quinn::VarInt::from_u32(4 * 1024 * 1024));
+}
+
 /// Bind QUIC's own UDP socket before handing it to the transport runtime.
 /// Endpoint::client alone follows the TUN default route after a node switch.
 pub(super) fn client_endpoint(address: SocketAddr) -> Result<quinn::Endpoint> {
