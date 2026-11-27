@@ -195,3 +195,41 @@ async fn authenticated_alpn_keeps_http3_control_alive_for_tcp_and_udp() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn one_bulk_stream_can_use_two_mib_of_connection_credit() {
+    let (server, mut client) = endpoints();
+    let mut outbound = Hysteria2Outbound::new("127.0.0.1", 9443, "fixture", None).unwrap();
+    outbound.skip_cert_verify = true;
+    client.set_default_client_config(outbound.build_client_config("h3").await.unwrap());
+    let connecting = client
+        .connect(server.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let (peer, connected) = tokio::join!(
+        async { server.accept().await.unwrap().await.unwrap() },
+        connecting
+    );
+    let connected = connected.unwrap();
+    let payload = Bytes::from(
+        (0..2 * 1024 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>(),
+    );
+    let expected = payload.clone();
+    let sender = tokio::spawn(async move {
+        let mut stream = peer.open_uni().await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.finish().unwrap();
+        assert_eq!(stream.stopped().await.unwrap(), None);
+        peer
+    });
+    let mut recv = connected.accept_uni().await.unwrap();
+    // Until the application reads, only the negotiated initial credit can
+    // advance the sender. Wait for acknowledgement of all bytes on the wire.
+    let peer = tokio::time::timeout(std::time::Duration::from_secs(5), sender)
+        .await
+        .expect("2 MiB stream stalled waiting for application reads")
+        .unwrap();
+    assert_eq!(recv.read_to_end(expected.len()).await.unwrap(), expected);
+    peer.close(0u32.into(), b"done");
+}

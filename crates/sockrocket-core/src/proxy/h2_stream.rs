@@ -9,6 +9,24 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{Semaphore, SemaphorePermit};
+
+/// Each permit covers one connection, including all its multiplexed streams.
+/// Under pressure new connections can still use the ordinary HTTP/2 window.
+pub(super) fn configure_download_window(
+    builder: &mut h2::client::Builder,
+) -> Option<SemaphorePermit<'static>> {
+    static SLOTS: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    let slots =
+        SLOTS.get_or_init(|| Semaphore::new(crate::resources::large_download_window_slots()));
+    let permit = slots.try_acquire().ok();
+    let window = if permit.is_some() { 512 * 1024 } else { 65_535 };
+    builder
+        .initial_window_size(window)
+        .initial_connection_window_size(window);
+    permit
+}
+
 fn failure() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP/2 stream failed")
 }
@@ -25,10 +43,9 @@ pub(super) async fn open(
     request: http::Request<()>,
 ) -> anyhow::Result<BoxProxyStream> {
     let mut builder = h2::client::Builder::new();
+    let download_window = configure_download_window(&mut builder);
     builder
         .enable_push(false)
-        .initial_window_size(65535)
-        .initial_connection_window_size(65535)
         .max_header_list_size(16 * 1024)
         .max_send_buffer_size(16 * 1024);
     let (client, connection) =
@@ -56,6 +73,7 @@ pub(super) async fn open(
         recv: None,
         pending: Bytes::new(),
         driver,
+        _download_window: download_window,
         write_closed: false,
         read_closed: false,
         terminal: false,
@@ -69,6 +87,7 @@ struct H2Stream {
     recv: Option<h2::RecvStream>,
     pending: Bytes,
     driver: Driver,
+    _download_window: Option<SemaphorePermit<'static>>,
     write_closed: bool,
     read_closed: bool,
     terminal: bool,

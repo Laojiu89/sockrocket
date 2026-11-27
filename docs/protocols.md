@@ -86,6 +86,8 @@ Mihomo YAML without an explicit UDP-over-stream version selects v1, and
 sing-box's `udp_over_stream` selects v2. The relay selection survives local
 saves, share links and Mihomo YAML exports. The heartbeat timer accepts sing-box
 Go-style durations and Mihomo millisecond intervals, with millisecond resolution.
+TUIC and ordinary Hysteria2 connections allow 4 MiB of receive credit per stream, shared within a 16 MiB limit per connection.
+
 The client sends the TUIC heartbeat command on live datagram-capable connections.
 TUIC accepts sing-box `zero_rtt_handshake` and Mihomo `reduce-rtt`. The first
 connection establishes a TLS session ticket. A resumed connection may send
@@ -159,6 +161,8 @@ Import a WireGuard profile, Clash node, sing-box outbound/endpoint, or Sockrocke
 
 Required fields are the private key, peer public key, peer host/port and one local CIDR address per required IP family. Optional fields include a preshared key, allowed IP networks, tunnel DNS IPs, MTU and persistent keepalive. The default MTU is 1280. Target-host DNS requests travel inside the encrypted tunnel; only the peer hostname uses bootstrap resolution.
 
+Outbound WireGuard TCP streams use a 512 KiB receive ring when download credit is available, with one credit per 64 MiB of device RAM (minimum one, maximum 32). Additional TCP streams use 32 KiB. Closing sockets retain the credit until their TCP state is released.
+
 WireGuard runs inside the process using BoringTun and smoltcp. It creates no host interface and changes no host routes, DNS settings or system proxy preferences. The outgoing UDP socket uses the application's physical-interface binding to avoid routing the tunnel into itself. The last flow releases the userspace endpoint and its polling task.
 
 Limits: up to 64 peers per node, at most two local addresses (one per family), four DNS IPs, 64 allowed networks per peer, eight active endpoints per process and 128 admitted flows per endpoint. IP fragmentation is not implemented: outgoing UDP payloads above `MTU - 28` for IPv4 or `MTU - 48` for IPv6 return an explicit error. AmneziaWG, OS interface requests and profile hooks are rejected. Shell hooks are never executed. `wireguard://` is an application share format rather than a universal WireGuard standard.
@@ -224,7 +228,7 @@ The native Rust client implements the XHTTP wire modes and options from [Xray v2
 
 Clash uses `network: xhttp` and `xhttp-opts`, while Xray JSON uses `xhttpSettings`. Advanced options may be direct fields or an `extra` object. As in Xray, an `extra` object replaces the direct advanced options, while the outer host/path/mode take precedence. Unknown options fail explicitly. `noSSEHeader`, `scMaxBufferedPosts`, `scStreamUpServerSecs`, `serverMaxHeaderBytes` and `h2Params` include server-side settings in Xray; accepting and preserving them does not apply them to an unrelated server. Their client-side counterparts remain locally bounded.
 
-Router budgets are deliberate: at most 32 cached connections per factory, 256 sessions per connection, an 8 MiB shared packet-upload budget, at most 4 MiB per upload packet and 128 KiB of HTTP headers. Stream pipes are 16 KiB; HTTP/2 stream windows are 64 KiB and ordinary QUIC connections use a 256 KiB receive window. Chrome QUIC preserves its required 15 MiB window and 2 MiB datagram budget; all XHTTP QUIC connections share a 96 MiB reservation limit. Cached idle connections are reclaimed after about 90 seconds. Expired reuse slots are retired without aborting existing requests. Dropping a tunnel cancels its request tasks; dropping the last connection owner stops its driver. Header timeouts and non-200 responses return errors without exposing response bodies.
+Router budgets are deliberate: at most 32 cached connections per factory, 256 sessions per connection, an 8 MiB shared packet-upload budget, at most 4 MiB per upload packet and 128 KiB of HTTP headers. Stream pipes are 16 KiB. XHTTP and gRPC share a process-wide allowance for 512 KiB HTTP/2 download windows, one connection per 64 MiB of device RAM (minimum one, maximum 32). Each connection shares its window across streams. Additional connections use the standard 65,535-byte window. Ordinary XHTTP/3 connections allow one download stream to use the full 256 KiB connection receive window. Chrome QUIC preserves its required 15 MiB window and 2 MiB datagram budget; all XHTTP QUIC connections share a 96 MiB reservation limit. Cached idle connections are reclaimed after about 90 seconds. Expired reuse slots are retired without aborting existing requests. Dropping a tunnel cancels its request tasks; dropping the last connection owner stops its driver. Header timeouts and non-200 responses return errors without exposing response bodies.
 
 REALITY uses the existing native authentication and classic-key-share fallback. Vision remains restricted to native TLS/REALITY over TCP and cannot be layered over XHTTP. Download settings support the native XHTTP/TLS/REALITY fields, not arbitrary Xray socket options, dialer proxies or transport masks; those settings are rejected. HTTP/3 browser fingerprints use the existing supported QUIC profiles, rather than claiming every Xray/browser fingerprint is reproduced.
 

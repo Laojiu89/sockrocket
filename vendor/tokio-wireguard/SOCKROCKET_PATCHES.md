@@ -25,3 +25,5 @@ No OS TUN interface, system route, DNS preference, or proxy setting is created b
 - Reset the shared BoringTun handshake rate limiter from the interface timer, including across long-running rekeys.
 
 - Retain the ephemeral-port lease in the socket registration until TCP teardown finishes, preventing tuple reuse against a draining connection; leases do not retain the interface itself.
+
+- Allow outbound TCP downloads to use a larger receive ring when shared credit is available. The socket registration holds this credit through TCP teardown.

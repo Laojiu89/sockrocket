@@ -231,6 +231,13 @@ impl WireguardOutbound {
         let mut options = Options::default();
         options.tcp.connect_timeout = CONNECT_TIMEOUT;
         options.tcp.recv_buffer_size = 32 * 1024;
+        static DOWNLOAD_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+        let slots = DOWNLOAD_SLOTS.get_or_init(|| {
+            Arc::new(Semaphore::new(
+                crate::resources::large_download_window_slots(),
+            ))
+        });
+        options.tcp.large_recv_buffer = Some((512 * 1024, slots.clone()));
         options.tcp.send_buffer_size = 32 * 1024;
         options.udp.recv_buffer_size = 64 * 1024;
         options.udp.send_buffer_size = 64 * 1024;

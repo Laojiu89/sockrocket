@@ -525,7 +525,7 @@ impl TuicOutbound {
         // Quinn's default aggregate receive window is VarInt::MAX. A slow
         // reader must backpressure the peer before per-stream buffers add up
         // beyond the TUN payload budget (which cannot account for QUIC RAM).
-        transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+        super::quic_conn::proxy_receive_windows(&mut transport);
         match self.congestion {
             CongestionControl::Bbr => {
                 transport.congestion_controller_factory(Arc::new(

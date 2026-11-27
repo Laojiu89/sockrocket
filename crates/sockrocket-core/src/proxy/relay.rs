@@ -10,7 +10,32 @@ where
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
     let size = crate::resources::relay_buffer_bytes();
-    tokio::io::copy_bidirectional_with_sizes(a, b, size, size).await
+    copy_streams(a, b, size).await
+}
+
+async fn copy_streams<A, B>(client: &mut A, remote: &mut B, base: usize) -> io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    // Match the TUN writer's 16 KiB batch. A slow reader or an idle
+    // connection holds at most one slot for the lifetime of its copy buffers.
+    const DOWNLOAD_BATCH: usize = 16 * 1024;
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let permit = if base < DOWNLOAD_BATCH {
+        let slots = SLOTS.get_or_init(|| {
+            tokio::sync::Semaphore::new(crate::resources::ResourceBudget::detect().tun_streams / 8)
+        });
+        slots.try_acquire().ok()
+    } else {
+        None
+    };
+    let download = if permit.is_some() {
+        DOWNLOAD_BATCH
+    } else {
+        base
+    };
+    tokio::io::copy_bidirectional_with_sizes(client, remote, base, download).await
 }
 
 /// Bound abandoned TUN relays even after EOF stops polling one read half.
@@ -112,14 +137,7 @@ where
         bytes: bytes.clone(),
         half_closed_at: half_closed_at.clone(),
     };
-    // TUN keeps many mostly idle flows alive. Reserve 16 KiB per direction
-    // instead of the desktop relay's 64 KiB (16 vs 64 MiB at 512 flows).
-    let relay = tokio::io::copy_bidirectional_with_sizes(
-        &mut observed_a,
-        &mut observed_b,
-        4 * 1024,
-        4 * 1024,
-    );
+    let relay = copy_streams(&mut observed_a, &mut observed_b, 4 * 1024);
     tokio::pin!(relay);
     let mut tick = tokio::time::interval(idle.min(std::time::Duration::from_secs(30)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -163,6 +181,57 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn tun_download_copies_bulk_data_in_segment_batches() {
+        use std::{
+            pin::Pin,
+            task::{Context, Poll},
+        };
+        use tokio::io::ReadBuf;
+
+        struct Download<'a> {
+            data: &'a [u8],
+            reads: usize,
+        }
+        impl AsyncRead for Download<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if !self.data.is_empty() {
+                    self.reads += 1;
+                }
+                Pin::new(&mut self.data).poll_read(cx, buf)
+            }
+        }
+
+        let payload: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut client = tokio::io::join(tokio::io::empty(), Vec::new());
+        let mut remote = tokio::io::join(
+            Download {
+                data: &payload,
+                reads: 0,
+            },
+            tokio::io::sink(),
+        );
+        let transferred = relay_with_pressure(
+            &mut client,
+            &mut remote,
+            std::time::Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(transferred, (0, payload.len() as u64));
+        assert_eq!(client.writer(), &payload);
+        let reads = remote.reader().reads;
+        assert!(
+            reads <= payload.len() / (16 * 1024),
+            "4 MiB download took {reads} reads"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn pressure_reclaims_idle_but_preserves_unpressured_relays() {

@@ -50,7 +50,8 @@ impl UdpSocket {
         );
         socket.bind(allocation.address()).unwrap();
 
-        let socket = IO::new(interface, socket, Some(allocation));
+        let lease = crate::io::AllocationGuard::new(&interface, allocation, None);
+        let socket = IO::new(interface, socket, Some(lease));
         socket
             .interface()
             .register_udp(Arc::clone(&socket), socket.lease())?;

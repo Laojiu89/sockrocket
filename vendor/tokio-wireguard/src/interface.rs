@@ -72,6 +72,9 @@ pub struct TcpOptions {
     pub connect_timeout: Duration,
     /// Size of the TCP receive buffer
     pub recv_buffer_size: usize,
+    /// Optional larger receive ring for outbound TCP, and a shared limit on
+    /// how many sockets may own one (including sockets draining after close).
+    pub large_recv_buffer: Option<(usize, Arc<tokio::sync::Semaphore>)>,
     /// Size of the TCP send buffer
     pub send_buffer_size: usize,
     /// Maximum number of pending connections on the listener
@@ -549,11 +552,29 @@ impl Default for Options {
     }
 }
 
+impl TcpOptions {
+    pub(crate) fn outbound_recv_buffer(
+        &self,
+    ) -> (usize, Option<tokio::sync::OwnedSemaphorePermit>) {
+        let large = self
+            .large_recv_buffer
+            .as_ref()
+            .filter(|(size, _)| *size > self.recv_buffer_size);
+        if let Some((size, slots)) = large {
+            if let Ok(credit) = slots.clone().try_acquire_owned() {
+                return (*size, Some(credit));
+            }
+        }
+        (self.recv_buffer_size, None)
+    }
+}
+
 impl Default for TcpOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
             recv_buffer_size: 64 * 1024,
+            large_recv_buffer: None,
             send_buffer_size: 16 * 1024,
             backlog: 128,
         }

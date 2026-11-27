@@ -272,7 +272,7 @@ impl Hysteria2Outbound {
         transport.max_idle_timeout(Some(
             quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)).unwrap(),
         ));
-        transport.receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+        super::quic_conn::proxy_receive_windows(&mut transport);
         transport.send_window(16 * 1024 * 1024);
         if self.chrome_fingerprint {
             super::quic_fingerprint::transport_config(&mut transport);
