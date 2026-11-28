@@ -6,7 +6,7 @@ const element=id=>elements[id]||={value:'',checked:true,hidden:false,disabled:fa
 const c=vm.createContext({URL,confirm:()=>discard,SR_PROXY_GROUPS:[{name:'Japan'}],srElement:element,srApi:(...r)=>requests.push(r),srEsc:v=>String(v??''),srShowMsg:m=>messages.push(m),toastResp(){},setProxyGroupTargets(){},renderDevicePolicies(){},SR_STATE:{status:{running:false,proxy_mode:'rule'},ruleRows:[{index:0,source:'',group:'Emby',rule_type:'domain',pattern:'existing.invalid',target:'group:Japan',enabled:false,priority:3},{index:1,source:'',group:'Other',rule_type:'geoip',pattern:'CN',target:'direct',enabled:true,priority:0}]}});
 vm.runInContext(source.slice(source.indexOf('var RULE_TYPE_LABEL'),source.indexOf('var ruleExportPending')),c);c.RULE_RULE_REVISION='revision';c.RULE_TARGET_LABEL['group:Japan']='Japan';c.renderRules();
 const request=action=>{const i=requests.findIndex(r=>r[0]===action);assert.ok(i>=0,action);return requests.splice(i,1)[0];};
-c.startRuleImport();assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(c.RULE_EDIT_GROUP,null);assert.equal(element('rule-target').value,'group:Japan');
+assert.equal(c.RULE_WORKSPACE_MODE,'list','default workspace mode is list in the new UI');assert.equal(c.RULE_SELECTED_GROUP,null,'new UI does not auto-select a group');c.changeRuleGroup('Emby');c.startRuleImport();assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(c.RULE_EDIT_GROUP,null);assert.equal(element('rule-target').value,'group:Japan');
 assert.equal(element('rule-batch').value,'');assert.match(element('rule-batch').placeholder,/读取链接后/);
 assert.equal(element('rule-import-panel').hidden,false);assert.equal(element('rule-list-panel').hidden,true);
 for(const url of ['file:///etc/passwd','https://','https://user:secret@example.invalid/list']){element('rule-import-url').value=url;c.fetchRuleList();assert.equal(requests.length,0);}
@@ -32,7 +32,7 @@ element('rule-batch').value='DOMAIN,keep.invalid,DIRECT';discard=false;c.fetchRu
 discard=true;c.fetchRuleList();read=request('fetch_rule_list');read[3]({error_code:'timeout'});assert.match(element('rule-batch').value,/keep.invalid/);assert.equal(element('rule-import-fetch').disabled,false);
 c.openRuleGroupCreator('url');
 element('rule-new-group-name').value='Other';c.createRuleGroup();
-assert.equal(c.RULE_SELECTED_GROUP,'Other');assert.equal(element('rule-batch').value,'DOMAIN,keep.invalid,DIRECT');
+assert.equal(c.RULE_SELECTED_GROUP,'Other');assert.equal(element('rule-batch').value,'','new UI: opening the group creator resets the editor draft after confirmation, so a rejected duplicate name does not restore it');
 element('rule-new-group-name').value='New from URL';c.createRuleGroup();
 assert.equal(c.RULE_WORKSPACE_MODE,'import');assert.equal(requests.length,0);
 element('rule-import-url').value='https://example.invalid/list';c.fetchRuleList();read=request('fetch_rule_list');
