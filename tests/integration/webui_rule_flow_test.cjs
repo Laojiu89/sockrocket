@@ -92,6 +92,16 @@ oldRead[3]();assert.equal(g.RULE_FLOW_ERROR,false,'stale failures cannot replace
 assert.match(grouped.element('rule-flow').innerHTML,/全部直连/);
 console.log('PASS: diagram/list group identity, disabled groups, priority segments, exact winner and out-of-order reads');
 
+{
+ const f=fixture(), c=f.context, host='192.0.2.8';
+ c.SR_STATE.ruleRows=[rule(0,{group:'constructor',target:'direct'}),rule(1,{group:'toString',target:'proxy'}),rule(2,{group:'Media',target:'reject'})];
+ c.SR_STATE.deviceBindings=[{source:host+'/32',group:'constructor',target:'direct'},{source:host+'/32',group:'toString',target:'proxy'},{source:host+'/32',group:'Media',target:'reject'}];
+ const stages=c.ruleFlowModel(c.SR_STATE.ruleRows,'rule',host).filter(s=>s.kind==='device_link');
+ assert.deepEqual(Array.from(stages,s=>s.title),['constructor','toString','Media'],'group names that shadow Object.prototype properties still get a device link stage');
+ console.log('PASS: device link stages for constructor/toString group names');
+}
+
+
 const mixed=fixture(),m=mixed.context;
 m.SR_STATE.ruleRows=[rule(0,{group:'Mixed',target:'proxy'}),rule(1,{group:'Mixed',target:'direct',enabled:false})];
 let mixedGroup=m.ruleFlowModel(m.SR_STATE.ruleRows,'rule','')[0];
