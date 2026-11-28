@@ -1,0 +1,744 @@
+#!/bin/sh
+# Sockrocket Plugin Installer
+# Supports:
+#   1. koolcenter / koolshare software center (auto-detected)
+#   2. Standard AsusWRT-Merlin firmware (armv7 / aarch64)
+#
+# Usage: sh install.sh [arch|platform]   — offline install from bundled package
+#        sh install.sh --update [arch]   — update binary only (preserve config)
+#   arch:     armv7 | aarch64 (CPU; auto-detected if not specified)
+#   platform: arm | hnd | hnd_v8 | qca | mtk | ipq32 | ipq64
+#             (koolcenter platform tags; same as fancyss package naming)
+#   Fully offline: this script never downloads anything.
+#
+# This script assumes NOTHING about the host toolchain. koolcenter's offline
+# installer runs package scripts in a stripped environment (no busybox, no
+# sed/grep/awk, restricted PATH); every external command is probed first and
+# has a pure-shell or sockrocket-cli fallback, and missing runtime tools (iptables,
+# nvram, cru, …) only produce warnings — runtime wiring is completed by the
+# services-start hook in the real firmware environment.
+
+# Do NOT use set -e — koolshare's base.sh changes error handling
+
+# ── Common paths ──────────────────────────────────────────────────────────────
+# Plugin data always lives under /jffs/addons/sockrocket/ (both modes)
+SOCKROCKET_DIR="/jffs/addons/sockrocket"
+SOCKROCKET_BIN="$SOCKROCKET_DIR/sockrocket-cli"
+SOCKROCKET_CONF="$SOCKROCKET_DIR/config.yaml"
+SOCKROCKET_SCRIPTS="$SOCKROCKET_DIR/scripts"
+CGI_BIN="/www/cgi-bin"
+
+# koolshare paths
+KS_DIR="/koolshare"
+KS_WEBS="$KS_DIR/webs"
+KS_SCRIPTS="$KS_DIR/scripts"
+KS_INIT="$KS_DIR/init.d"
+MODULE="sockrocket"   # must match the package directory name
+
+CYAN='\033[0;36m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+info()  { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${CYAN}[Sockrocket] %s${NC}\n" "$*"; }
+ok()    { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.info "$*";  printf "${GREEN}[Sockrocket] ✓ %s${NC}\n" "$*"; }
+warn()  { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.warn "$*";  printf "${YELLOW}[Sockrocket] ! %s${NC}\n" "$*" >&2; }
+err()   { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.err "$*";   printf "${RED}[Sockrocket] ✗ %s${NC}\n" "$*" >&2; exit 1; }
+die()   { which logger >/dev/null 2>&1 && logger -t sockrocket-install -p daemon.crit "$*";  printf "${RED}[Sockrocket] FATAL: %s${NC}\n" "$*" >&2; exit 1; }
+
+# ── Minimal toolbelt (probed, with fallbacks) ──────────────────────────────────
+have() { which "$1" >/dev/null 2>&1; }
+
+# Restore the router-standard PATH (koolcenter strips it, base.sh clobbers it).
+restore_path() {
+    for d in /usr/sbin /usr/bin /sbin /bin /opt/sbin /opt/bin /koolshare/bin /koolshare/scripts; do
+        [ -d "$d" ] && case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH" ;; esac
+    done
+    export PATH
+}
+restore_path
+
+# xcp: cp with a pure-shell fallback (cat > dst)
+xcp() {
+    if have cp; then
+        cp "$1" "$2"
+    else
+        cat < "$1" > "$2"
+    fi
+}
+
+# xlink: ln -sf with a copy fallback
+xlink() {
+    if have ln; then
+        ln -sf "$1" "$2" 2>/dev/null && return 0
+    fi
+    xcp "$1" "$2" 2>/dev/null
+}
+
+# read the first line of a file without cat
+read_first_line() {
+    IFS= read -r _rfl < "$1" 2>/dev/null || _rfl=""
+    printf '%s' "$_rfl"
+}
+
+# ── Detect koolshare environment ───────────────────────────────────────────────
+# NOTE: deliberately NOT sourcing base.sh — we use none of its helpers, and it
+# is free to clobber PATH or redefine shell helpers (which once broke our arch
+# detection). File existence is enough to detect the environment.
+KOOLSHARE=0
+if [ -d "$KS_DIR" ] && [ -f "$KS_DIR/scripts/base.sh" ]; then
+    KOOLSHARE=1
+fi
+restore_path
+
+# ── Parse arguments ────────────────────────────────────────────────────────────
+UPDATE_ONLY=false
+ARCH_ARG=""
+for arg in "$@"; do
+    case "$arg" in
+        --update) UPDATE_ONLY=true ;;
+        armv7|aarch64) ARCH_ARG="$arg" ;;
+        # fancyss-style platform tags map to CPU arch for binary selection
+        arm|hnd|qca|ipq32) ARCH_ARG="armv7" ;;
+        hnd_v8|mtk|ipq64)  ARCH_ARG="aarch64" ;;
+    esac
+done
+
+# ── Architecture detection ─────────────────────────────────────────────────────
+# No command -v guard here (base.sh may have redefined our helpers in earlier
+# revisions): call uname directly, fall back to absolute paths, then cpuinfo.
+detect_arch() {
+    local machine=""
+    machine=$(uname -m 2>/dev/null) || machine=""
+    [ -z "$machine" ] && [ -x /usr/bin/uname ] && machine=$(/usr/bin/uname -m 2>/dev/null)
+    [ -z "$machine" ] && [ -x /bin/uname ] && machine=$(/bin/uname -m 2>/dev/null)
+    if [ -z "$machine" ] && [ -r /proc/cpuinfo ]; then
+        # Pure-shell fallback: scan cpuinfo for architecture markers
+        local line
+        while IFS= read -r line; do
+            case "$line" in
+                *aarch64*|*AArch64*) machine="aarch64"; break ;;
+                *ARMv7*|*armv7*)     machine="armv7"; break ;;
+            esac
+        done < /proc/cpuinfo
+    fi
+    case "$machine" in
+        armv7*|armhf)  echo "armv7" ;;
+        aarch64|arm64) echo "aarch64" ;;
+        *) echo "" ;;
+    esac
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${0}")" 2>/dev/null && pwd)"
+[ -z "$SCRIPT_DIR" ] && SCRIPT_DIR="/tmp/$MODULE"
+
+if [ -n "$ARCH_ARG" ]; then
+    ARCH="$ARCH_ARG"
+else
+    ARCH="$(detect_arch)"
+fi
+if [ -z "$ARCH" ]; then
+    warn "PATH=$PATH"
+    err "Cannot auto-detect architecture, please specify manually: sh install.sh aarch64 or sh install.sh armv7"
+fi
+info "Target architecture: $ARCH"
+
+# ── Dependency report (informational only — never fatal) ──────────────────────
+check_deps() {
+    restore_path
+    local missing=""
+    for cmd in cp chmod ln mkdir rm sed grep base64 awk pgrep curl iptables ip service nvram cru dbus; do
+        have "$cmd" || missing="$missing $cmd"
+    done
+    if [ -n "$missing" ]; then
+        warn "Restricted install environment, the following tools are unavailable:$missing"
+        warn "Falling back to plain shell; runtime wiring is completed by the services-start hook in a normal environment"
+    else
+        info "All system dependencies found"
+    fi
+}
+
+# ── Resolve binary source (offline only — never downloads anything) ───────────
+# Prefer a single bin/sockrocket-cli (fancyss-style per-platform package), then
+# fall back to arch-suffixed names used by older / multi-arch bundles.
+BINARY=""
+if [ -f "$SCRIPT_DIR/bin/sockrocket-cli" ]; then
+    BINARY="$SCRIPT_DIR/bin/sockrocket-cli"
+    info "Using bundled binary: $BINARY"
+elif [ -f "$SCRIPT_DIR/bin/sockrocket-cli-$ARCH" ]; then
+    BINARY="$SCRIPT_DIR/bin/sockrocket-cli-$ARCH"
+    info "Using bundled binary: $BINARY"
+else
+    err "Built-in binary not found under $SCRIPT_DIR/bin/
+  Expected: bin/sockrocket-cli  or  bin/sockrocket-cli-$ARCH
+  Use the offline package matching your router platform
+  (sockrocket-merlin-{arm|hnd|hnd_v8|qca|mtk|ipq32|ipq64}.tar.gz).
+  If architecture detection was wrong, specify manually:
+    sh install.sh aarch64 | sh install.sh armv7
+    sh install.sh hnd_v8  | sh install.sh hnd"
+fi
+
+# ── Environment check ─────────────────────────────────────────────────────────
+JFFS_OK=0
+have mountpoint && mountpoint -q /jffs 2>/dev/null && JFFS_OK=1
+have df && df /jffs >/dev/null 2>&1 && JFFS_OK=1
+[ ! -d /jffs ] || JFFS_OK=1   # directory existing is good enough in practice
+if [ "$JFFS_OK" != "1" ]; then
+    die "/jffs is not mounted. Enable JFFS partition in router web UI (Administration -> System -> Enable JFFS custom scripts)"
+fi
+info "/jffs partition OK"
+check_deps
+
+# Count logical file sizes in 4 KiB blocks, including sparse files copied from
+# an offline package. Only the selected architecture's binary is installed.
+file_kib() {
+    local bytes
+    bytes=$(wc -c < "$1") || return 1
+    echo $(( (bytes + 4095) / 4096 * 4 ))
+}
+
+payload_kib() {
+    local path amount total=0
+    for path in "$@"; do
+        [ -f "$path" ] || continue
+        amount=$(file_kib "$path") || return 1
+        total=$((total + amount))
+    done
+    echo "$total"
+}
+
+# df must see the destination filesystem even before its directories exist.
+destination_space() {
+    local path="$1" listing device blocks used available capacity mount dev
+    while [ ! -d "$path" ]; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+        path=${path%/*}
+        [ -n "$path" ] || path=/
+    done
+    [ -w "$path" ] || return 1
+    listing=$(df -Pk "$path") || return 1
+    # A name such as tmpfs may identify several independent mounts.
+    dev=$(stat -L -c %d "$path" 2>/dev/null) || dev=$(stat -L -f %d "$path" 2>/dev/null) || dev=
+    while read -r device blocks used available capacity mount; do
+        case "$available" in ''|*[!0-9]*) continue ;; esac
+        case "$dev" in ''|*[!0-9]*) dev="$device:$mount" ;; esac
+        printf '%s %s\n' "$dev" "$available"
+        return 0
+    done <<EOF
+$listing
+EOF
+    return 1
+}
+
+require_install_kib() {
+    [ "$2" -ge "$3" ] || err "安装空间不足：$1 需要 $3 KiB，可用 $2 KiB，还差 $(($3 - $2)) KiB"
+}
+
+check_install_space() {
+    # The transaction worker measures and stages its rollback and integration files.
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" != 1 ] || return 0
+    # Merlin's minimal BusyBox shell may lack the command builtin.
+    if ! have df || ! have wc; then
+        warn "Cannot preflight disk space in this restricted installer environment"
+        return 0
+    fi
+    local root_space root_device available required amount added target space config hook largest=0
+    root_space=$(destination_space "$SOCKROCKET_DIR") || err "Cannot read installation filesystem space"
+    set -- $root_space
+    root_device=$1
+    available=$2
+    required=$(file_kib "$BINARY") || err "Cannot measure bundled binary"
+    # The old executable may still be open. The pending copy needs its full size.
+    if [ "$UPDATE_ONLY" = true ]; then
+        require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + 8))"
+        return
+    fi
+    config=$SCRIPT_DIR/config.yaml.template
+    [ ! -f "$SOCKROCKET_CONF" ] || config=$SOCKROCKET_CONF
+    amount=$(payload_kib "$config" "$SCRIPT_DIR/.valid" "$SCRIPT_DIR/version" \
+        "$SCRIPT_DIR/uninstall.sh" "$SCRIPT_DIR/webui/sockrocket.asp" "$SCRIPT_DIR/res/icon-sockrocket.png" \
+        "$SCRIPT_DIR/scripts/sockrocket.sh" "$SCRIPT_DIR/scripts/iptables.sh" "$SCRIPT_DIR/scripts/update.sh" \
+        "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SCRIPT_DIR/scripts/dnsmasq.conf" \
+        "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure installed files"
+    required=$((required + amount))
+    # Each hook grows by at most one block; only one original is staged at a time.
+    set -- wan-event wan-start dhcpc-event dnsmasq.postconf
+    [ "$KOOLSHARE" = 1 ] || set -- "$@" firewall-start nat-start services-start service-event
+    for hook in "$@"; do
+        amount=$(payload_kib "/jffs/scripts/$hook") || err "Cannot measure existing hook"
+        [ "$amount" -le "$largest" ] || largest=$amount
+    done
+    # Plugin / hook directories, CGI launcher and small generated state files.
+    required=$((required + largest + 4 * $# + 32))
+    require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+    if [ "$KOOLSHARE" = 1 ]; then
+        # On some images the menu page and its persistent boot-time mirror
+        # are separate files. On others both names resolve to the same directory.
+        if [ -d /jffs/.koolshare/webs ] && ! [ "$KS_WEBS" -ef /jffs/.koolshare/webs ]; then
+            amount=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Software Center page"
+            required=$((required + amount))
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$required"
+        fi
+        local icon="$SCRIPT_DIR/res/icon-sockrocket.png"
+        [ -f "$icon" ] || icon="$SCRIPT_DIR/webui/icon-sockrocket.png"
+        added=$(payload_kib "$SCRIPT_DIR/webui/sockrocket.asp" "$icon" "$SCRIPT_DIR/uninstall.sh" \
+            "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SCRIPT_DIR/scripts/sockrocket_status.sh") || err "Cannot measure Software Center files"
+        added=$((added + 24))
+        space=$(destination_space "$KS_DIR") || err "Cannot read Software Center filesystem space"
+        set -- $space
+        if [ "$1" = "$root_device" ]; then
+            require_install_kib "$SOCKROCKET_DIR" "$available" "$((required + added))"
+        else
+            require_install_kib "$KS_DIR" "$2" "$added"
+        fi
+    else
+        added=$(file_kib "$SCRIPT_DIR/webui/sockrocket.asp") || err "Cannot measure Merlin page"
+        added=$((added + 4))
+        local possible=0 last_target="" last_free=0 last_need=0 need
+        for target in /www/ext/sockrocket /tmp/var/wwwext/sockrocket; do
+            space=$(destination_space "$target") || continue
+            set -- $space
+            need=$added
+            [ "$1" != "$root_device" ] || need=$((required + added))
+            if [ "$2" -ge "$need" ]; then possible=1; break; fi
+            last_target=$target last_free=$2 last_need=$need
+        done
+        if [ "$possible" != 1 ]; then
+            [ -n "$last_target" ] || err "Cannot find a Merlin page destination"
+            require_install_kib "$last_target" "$last_free" "$last_need"
+        fi
+    fi
+}
+
+check_install_space
+
+# ── Update-only mode ───────────────────────────────────────────────────────────
+# Stage beside the destination and rename: cp over a running Linux executable
+# fails with ETXTBSY (the API stays up independently of the proxy).
+install_binary() {
+    local pending="$SOCKROCKET_BIN.install-new"
+    if ! xcp "$BINARY" "$pending" || ! chmod 700 "$pending"; then
+        rm -f "$pending" 2>/dev/null
+        err "Could not stage the bundled binary; existing binary retained"
+    fi
+    local version
+    version=$("$pending" --version 2>/dev/null) || version=""
+    case "$version" in
+        'sockrocket-cli '*) ;;
+        *) rm -f "$pending"; err "Bundled binary cannot run on this platform; existing binary retained" ;;
+    esac
+    if ! mv -f "$pending" "$SOCKROCKET_BIN"; then
+        rm -f "$pending" 2>/dev/null
+        err "Could not publish the bundled binary; existing binary retained"
+    fi
+}
+
+if [ "$UPDATE_ONLY" = "true" ]; then
+    info "Update mode: replacing binary only (config preserved)..."
+    [ -d "$SOCKROCKET_DIR" ] || err "Sockrocket is not installed. Run without --update first."
+    WAS_RUNNING=false
+    PID="$(read_first_line "$SOCKROCKET_DIR/sockrocket.pid")"
+    [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null && WAS_RUNNING=true
+    [ "$WAS_RUNNING" = "true" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" stop 2>/dev/null || true
+    install_binary
+    if [ -f "$SCRIPT_DIR/scripts/sockrocket.sh" ]; then
+        sh "$SCRIPT_DIR/scripts/sockrocket.sh" install-cgi || warn "Could not refresh CGI launcher"
+    fi
+    ok "Binary updated: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
+    # Restart the API bridge too if it is running — it still holds the old binary
+    [ -f "$SOCKROCKET_DIR/sockrocket-api.pid" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart 2>/dev/null || true
+    [ "$WAS_RUNNING" = "true" ] && "$SOCKROCKET_SCRIPTS/sockrocket.sh" start
+    exit 0
+fi
+
+# Merlin only dispatches /jffs/scripts/* when this NVRAM switch is enabled.
+# A mounted JFFS directory alone does not prove that installed hooks will run.
+if have nvram && [ "$(nvram get jffs2_scripts 2>/dev/null)" = "0" ]; then
+    err "JFFS custom scripts are disabled. Enable them in Administration -> System before installing Sockrocket, then rerun install.sh."
+fi
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
+install_default_config() {
+    if [ -f "$SOCKROCKET_CONF" ]; then
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
+        ok "Existing config and proxy state preserved"
+        return 0
+    fi
+    info "Generating default config (proxy stopped)..."
+    # Persist Stop before any boot/retry hook can launch the daemon.
+    : > "$SOCKROCKET_DIR/stopped" || err "Could not persist the default stopped state"
+    (umask 077; xcp "$SCRIPT_DIR/config.yaml.template" "$SOCKROCKET_CONF") || err "Could not install default config"
+    chmod 600 "$SOCKROCKET_CONF" || err "Could not make the default configuration private"
+    ok "Default config at $SOCKROCKET_CONF"
+}
+
+install_common_files() {
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" != 1 ] || return 0
+
+    # Binary, scripts, config — same in both modes
+    info "Creating data directories..."
+    mkdir -p "$SOCKROCKET_DIR" "$SOCKROCKET_SCRIPTS" "$CGI_BIN" /jffs/scripts /jffs/configs/dnsmasq.d 2>/dev/null
+
+    if [ -f "$SOCKROCKET_CONF" ]; then
+        chmod 600 "$SOCKROCKET_CONF" || err "Could not make the existing configuration private"
+        [ ! -L "$SOCKROCKET_CONF.bak" ] || err "Configuration backup path must not be a symlink"
+        [ ! -f "$SOCKROCKET_CONF.bak" ] || \
+            chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
+        (umask 077; xcp "$SOCKROCKET_CONF" "$SOCKROCKET_CONF.bak") || err "Could not back up the configuration"
+        chmod 600 "$SOCKROCKET_CONF.bak" || err "Could not make the configuration backup private"
+        ok "Existing config backed up to $SOCKROCKET_CONF.bak"
+    fi
+
+    info "Installing sockrocket-cli binary..."
+    install_binary
+    ok "Binary installed: $("$SOCKROCKET_BIN" --version 2>/dev/null || echo 'version unknown')"
+
+    [ ! -f "$SCRIPT_DIR/.valid" ] || xcp "$SCRIPT_DIR/.valid" "$SOCKROCKET_DIR/platform"
+    [ ! -f "$SCRIPT_DIR/scripts/update.sh" ] || xcp "$SCRIPT_DIR/scripts/update.sh" "$SOCKROCKET_SCRIPTS/update.sh"
+    info "Installing control scripts..."
+    xcp "$SCRIPT_DIR/scripts/sockrocket.sh"       "$SOCKROCKET_SCRIPTS/sockrocket.sh"
+    xcp "$SCRIPT_DIR/scripts/iptables.sh"  "$SOCKROCKET_SCRIPTS/iptables.sh"
+    xcp "$SCRIPT_DIR/scripts/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh"
+    xcp "$SCRIPT_DIR/scripts/dnsmasq.conf" "$SOCKROCKET_SCRIPTS/dnsmasq.conf.template"
+    [ -f "$SCRIPT_DIR/scripts/sockrocket_api.sh" ] && xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh"
+    xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh"
+    mkdir -p "$SOCKROCKET_DIR/webui" 2>/dev/null
+    [ -s "$SCRIPT_DIR/webui/sockrocket.asp" ] || err "Package Web UI page missing or empty"
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$SOCKROCKET_DIR/webui/sockrocket.asp" || err "Could not install persistent Web UI page"
+    if [ -f "$SCRIPT_DIR/res/icon-sockrocket.png" ]; then
+        mkdir -p "$SOCKROCKET_DIR/res" 2>/dev/null || true
+        xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$SOCKROCKET_DIR/res/icon-sockrocket.png" 2>/dev/null || true
+    fi
+    if [ "$KOOLSHARE" != 1 ] && [ -f "$SCRIPT_DIR/version" ]; then
+        xcp "$SCRIPT_DIR/version" "$SOCKROCKET_DIR/version" 2>/dev/null || true
+    fi
+    # Keep uninstall next to the install for SSH / manual removal
+    if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+        xcp "$SCRIPT_DIR/uninstall.sh" "$SOCKROCKET_DIR/uninstall.sh"
+        chmod +x "$SOCKROCKET_DIR/uninstall.sh" 2>/dev/null || true
+    fi
+    chmod +x "$SOCKROCKET_SCRIPTS/sockrocket.sh" "$SOCKROCKET_SCRIPTS/iptables.sh" "$SOCKROCKET_SCRIPTS/dnsmasq-postconf.sh" "$SOCKROCKET_SCRIPTS/sockrocket_api.sh" "$SOCKROCKET_SCRIPTS/sockrocket_status.sh" 2>/dev/null
+    ok "Control scripts installed"
+
+    info "Installing CGI backend..."
+    sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-cgi || warn "Could not install CGI launcher — will retry on next start"
+    ok "CGI backend installed (Rust, built into sockrocket-cli)"
+
+    # Smoke-test the CGI binary (no grep — shell case match)
+    CGI_OUT=$(QUERY_STRING="action=version" "$SOCKROCKET_DIR/sockrocket.cgi" 2>/dev/null)
+    case "$CGI_OUT" in
+        *'"version"'*) ok "CGI backend verified" ;;
+        *)             warn "CGI smoke test failed — Web UI may not work" ;;
+    esac
+
+    install_default_config
+}
+
+# install_hook <script> <content...> — pure-shell, no sed/grep/awk.
+install_hook() {
+    local script="$1"
+    shift  # discard only the script path; the next argument is the hook body
+    local content="$*"
+
+    # Create script if missing
+    if [ ! -f "$script" ]; then
+        printf '#!/bin/sh\n' > "$script" && chmod +x "$script" 2>/dev/null
+    fi
+
+    # Remove any previous Sockrocket block (anchor markers, old-style markers, and
+    # any line referencing /jffs/addons/sockrocket/) using only shell builtins.
+    local tmp="$script.Sockrocket-tmp"
+    local in_block=0
+    : > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "# >>> SOCKROCKET_AUTO_START >>>") in_block=1; continue ;;
+            "# <<< SOCKROCKET_AUTO_END <<<")   in_block=0; continue ;;
+        esac
+        [ "$in_block" = "1" ] && continue
+        case "$line" in
+            *"/jffs/addons/sockrocket/"*|*" /jffs/addons/sockrocket/"*|*"\"/jffs/addons/sockrocket/"*) continue ;;
+            "# Sockrocket firewall"* | "# Sockrocket services"* | "# Sockrocket service-event"*) continue ;;
+        esac
+        printf '%s\n' "$line" >> "$tmp"
+    done < "$script"
+    # Copy back without relying on mv
+    cat < "$tmp" > "$script" 2>/dev/null || xcp "$tmp" "$script"
+    rm -f "$tmp" 2>/dev/null
+
+    # Append with clear anchor markers
+    {
+        echo "# >>> SOCKROCKET_AUTO_START >>>"
+        if [ "$script" = /jffs/scripts/services-start ]; then
+        echo '[ ! -f /jffs/addons/sockrocket/update-recover.sh ] || [ -n "${SOCKROCKET_UPDATE_ACTIVE:-}" ] || sh /jffs/addons/sockrocket/update-recover.sh --recover || exit 1'
+        fi
+        echo "# Auto-generated by Sockrocket install.sh. Do not edit between markers."
+        echo "$content"
+        echo "# <<< SOCKROCKET_AUTO_END <<<"
+    } >> "$script"
+
+    chmod +x "$script" 2>/dev/null
+    ok "Hook installed in $(basename "$script" 2>/dev/null || echo "$script")"
+}
+
+# Bring up API and reload an already-enabled daemon without blocking Softcenter.
+#
+# Softcenter runs install.sh under start-stop-daemon and shows
+# "数据加载中，请稍候重试" if we stall on TUN/DNS waits (20–35s). So we:
+#   1. Start the API bridge synchronously (~1s) — Web UI needs it.
+#   2. Restart an enabled daemon detached (fresh installs keep their Stop marker).
+#   3. HUP-immune + cru retry so softcenter killing the install session
+#      cannot leave the plugin dead.
+post_install_start() {
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" != 1 ] || return 0
+
+    [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ] || return 0
+    info "Starting management API (saved proxy state is preserved)..."
+    "$SOCKROCKET_SCRIPTS/sockrocket.sh" api-restart >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 || true
+    sleep 1
+
+    (
+        trap '' HUP INT TERM
+        sleep 1
+        # restart loads the new binary and respects an existing manual Stop.
+        SOCKROCKET_FAST_START=1 "$SOCKROCKET_SCRIPTS/sockrocket.sh" restart
+    ) >>"$SOCKROCKET_DIR/sockrocket.log" 2>&1 </dev/null &
+
+    if have cru; then
+        cru a SockrocketBoot "*/2 * * * * SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh api-start; SOCKROCKET_FAST_START=1 $SOCKROCKET_SCRIPTS/sockrocket.sh restart; cru d SockrocketBoot" 2>/dev/null || true
+    fi
+
+    local api_ok=0
+    if [ -f "$SOCKROCKET_DIR/sockrocket-api.pid" ]; then
+        kill -0 "$(cat "$SOCKROCKET_DIR/sockrocket-api.pid")" 2>/dev/null && api_ok=1
+    fi
+    if [ "$api_ok" = "1" ]; then
+        ok "API bridge is running (proxy remains stopped until explicitly started on first install)"
+    else
+        warn "API bridge not yet up — Softcenter Web UI may need a page refresh in a few seconds"
+    fi
+}
+
+# Both standard Merlin and koolcenter run on the same firmware WAN event API.
+# Install these hooks in either package mode so dial-up changes are handled.
+install_wan_hooks() {
+    # Merlin 384.15+ reports PPPoE/DHCP/static WAN connections here. Rebuild
+    # our private policy route and re-pin DNS after the firmware's WAN update.
+    install_hook "/jffs/scripts/wan-event" \
+'if [ "$2" = "connected" ] && [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ]; then
+    /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+fi
+'
+
+    # Older Merlin releases still use wan-start for the connected event.
+    install_hook "/jffs/scripts/wan-start" \
+'[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh wan-restore
+'
+
+    # DHCPv4 renew can replace resolv.dnsmasq without another WAN event.
+    # DHCPv6/RA updates can also replace the LAN IPv6 prefix, so refresh only
+    # the IPv6 policy and DNS on those events (not the whole IPv4 firewall).
+    install_hook "/jffs/scripts/dhcpc-event" \
+'case "$1:$2" in
+    bound:6|renew:6|stopped:6|unbound:6|updated:*|rebound:*|informed:*|ra-updated:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh dhcpv6-restore ;;
+    bound:*|renew:*)
+        [ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+            /jffs/addons/sockrocket/scripts/sockrocket.sh pin-dns ;;
+esac
+'
+}
+
+install_dns_postconf_hook() {
+    sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-dns-hook || warn "Could not register Merlin dnsmasq.postconf; DNS interception will stay disabled until repaired"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# koolshare / koolcenter install path
+# ─────────────────────────────────────────────────────────────────────────────
+ks_install() {
+    local VER="" cli_version
+    info "Installing Sockrocket in koolcenter mode..."
+    install_common_files
+    if [ -f "$SCRIPT_DIR/version" ]; then
+        IFS= read -r VER < "$SCRIPT_DIR/version" || :
+    fi
+    if [ -z "$VER" ]; then
+        cli_version=$("$SOCKROCKET_BIN" --version) || err "Could not read installed CLI version"
+        case "$cli_version" in
+            'sockrocket-cli '?*) VER=${cli_version#sockrocket-cli } ;;
+            *) err "Invalid installed CLI version" ;;
+        esac
+    fi
+    printf '%s\n' "$VER" > "$SOCKROCKET_DIR/version" || err "Could not record installed version"
+
+    # koolshare Web UI: Module_sockrocket.asp → /koolshare/webs/
+    info "Installing koolshare Web UI..."
+    mkdir -p "$KS_WEBS" "$KS_SCRIPTS" "$KS_INIT" "$KS_DIR/res" 2>/dev/null
+    xcp "$SCRIPT_DIR/webui/sockrocket.asp" "$KS_WEBS/Module_sockrocket.asp" && chmod 644 "$KS_WEBS/Module_sockrocket.asp" || err "Could not publish Software Center page"
+    ok "Web UI installed to $KS_WEBS/Module_sockrocket.asp"
+
+    # Software-center tile icon (softcenter loads /koolshare/res/icon-<module>.png)
+    if [ -f "$SCRIPT_DIR/res/icon-sockrocket.png" ]; then
+        xcp "$SCRIPT_DIR/res/icon-sockrocket.png" "$KS_DIR/res/icon-sockrocket.png"
+        ok "Software-center icon installed"
+    elif [ -f "$SCRIPT_DIR/webui/icon-sockrocket.png" ]; then
+        xcp "$SCRIPT_DIR/webui/icon-sockrocket.png" "$KS_DIR/res/icon-sockrocket.png"
+        ok "Software-center icon installed"
+    else
+        warn "Software-center icon missing (res/icon-sockrocket.png) — tile may show blank"
+    fi
+
+    # koolshare startup wrapper: delegates to our sockrocket.sh.
+    # Written with printf, not a `cat <<EOF` heredoc: the koolcenter offline
+    # installer's sandbox may not provide cat (that is why xcp exists), and
+    # this write previously had no fallback — the whole wrapper was lost.
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'case "$1" in start|"") [ ! -f /jffs/addons/sockrocket/update-recover.sh ] || sh /jffs/addons/sockrocket/update-recover.sh --recover || exit 1 ;; esac' \
+        'case "$1" in' \
+        '    start|"") /jffs/addons/sockrocket/scripts/sockrocket.sh boot ;;' \
+        '    stop)     /jffs/addons/sockrocket/scripts/sockrocket.sh stop' \
+        '              /jffs/addons/sockrocket/scripts/sockrocket.sh api-stop ;;' \
+        '    restart)  /jffs/addons/sockrocket/scripts/sockrocket.sh restart ;;' \
+        '    *[!0-9]*) /jffs/addons/sockrocket/scripts/sockrocket.sh "$@" ;;' \
+        '    *)        case "$(dbus get sockrocket_enable 2>/dev/null)" in' \
+        '                  1) /jffs/addons/sockrocket/scripts/sockrocket.sh start ;;' \
+        '                  *) /jffs/addons/sockrocket/scripts/sockrocket.sh stop ;;' \
+        '              esac' \
+        '              curl --max-time 3 -fsS -X POST --data "$1" "http://127.0.0.1:3030/_resp/$1" >/dev/null 2>&1 ;;' \
+        'esac' > "$KS_SCRIPTS/${MODULE}_config.sh"
+    chmod +x "$KS_SCRIPTS/${MODULE}_config.sh" 2>/dev/null
+
+    # koolcenter API bridge script (platform job dispatcher target:
+    # the page calls POST /_api/ {method: "sockrocket_api.sh"}, this script runs
+    # the Rust CGI synchronously and drops the JSON into /tmp/upload/ for
+    # the page to poll via /_temp/). /www is read-only on this platform,
+    # so the /cgi-bin symlink path cannot work here.
+    xcp "$SCRIPT_DIR/scripts/sockrocket_api.sh" "$KS_SCRIPTS/sockrocket_api.sh"
+    chmod +x "$KS_SCRIPTS/sockrocket_api.sh" 2>/dev/null
+    xcp "$SCRIPT_DIR/scripts/sockrocket_status.sh" "$KS_SCRIPTS/sockrocket_status.sh"
+    chmod +x "$KS_SCRIPTS/sockrocket_status.sh" 2>/dev/null
+    ok "API bridge installed to $KS_SCRIPTS/sockrocket_api.sh"
+
+    # Softcenter looks for /koolshare/scripts/uninstall_<module>.sh
+    # Without this file it only clears dbus and leaves /jffs/addons/sockrocket.
+    if [ -f "$SCRIPT_DIR/uninstall.sh" ]; then
+        xcp "$SCRIPT_DIR/uninstall.sh" "$KS_SCRIPTS/uninstall_${MODULE}.sh"
+        chmod +x "$KS_SCRIPTS/uninstall_${MODULE}.sh" 2>/dev/null || true
+        ok "Softcenter uninstall script installed (uninstall_${MODULE}.sh)"
+    else
+        warn "uninstall.sh missing from package — softcenter uninstall will be incomplete"
+    fi
+
+    # Register with koolshare init.d for auto-start
+    xlink "$KS_SCRIPTS/${MODULE}_config.sh" "$KS_INIT/S98${MODULE}.sh"
+    ok "Registered koolshare startup hook"
+    install_wan_hooks
+    install_dns_postconf_hook
+
+    # Register plugin metadata in dbus (software center status)
+    if have dbus; then
+        dbus set "${MODULE}_version"="${VER}"                        2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_version"="${VER}"      2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_install"="1"          2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_name"="${MODULE}" || err "Could not register Software Center module name"
+        dbus set "softcenter_module_${MODULE}_title"="Sockrocket"          2>/dev/null || true
+        dbus set "softcenter_module_${MODULE}_description"="Transparent proxy (TUN/SOCKS5/HTTP)" 2>/dev/null || true
+        # Page the software center opens when the icon is clicked. Without
+        # indexpage the icon shows up but clicking it does nothing — the
+        # plugin appears "unreachable" even though everything else works.
+        dbus set "softcenter_module_${MODULE}_indexpage"="Module_${MODULE}.asp" || err "Could not register Software Center page"
+        ok "Plugin registered in dbus"
+    else
+        warn "dbus unavailable: Software Center may not list Sockrocket. Open /Module_sockrocket.asp directly."
+    fi
+    "$SOCKROCKET_SCRIPTS/sockrocket.sh" software-center-status >/dev/null 2>&1 || true
+
+    # koolshare installer expects temp dir cleanup
+    [ "${SOCKROCKET_INTEGRATION_ONLY:-0}" = 1 ] || rm -rf "/tmp/${MODULE}" "/tmp/${MODULE}.tar.gz" 2>/dev/null || true
+
+    post_install_start
+
+    echo ""
+    ok "Sockrocket ${VER} installed successfully!"
+    echo ""
+    echo "  Config file : $SOCKROCKET_CONF"
+    echo "  Web UI   : Software Center -> Sockrocket"
+    echo ""
+    echo "  Start: $SOCKROCKET_SCRIPTS/sockrocket.sh start"
+    echo "  Stop: $SOCKROCKET_SCRIPTS/sockrocket.sh stop"
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standard AsusWRT-Merlin install path
+# ─────────────────────────────────────────────────────────────────────────────
+merlin_install() {
+    info "Installing in Standard Merlin mode..."
+    install_common_files
+
+    info "Installing Web UI page..."
+    local page
+    page=$(sh "$SOCKROCKET_SCRIPTS/sockrocket.sh" install-page) || err "Could not publish Merlin Web UI page"
+    ok "Web UI installed to $page"
+
+    info "Hooking into Merlin startup scripts..."
+
+    install_hook "/jffs/scripts/firewall-start" \
+'# Serialized reapply; respects manual stop and degraded fail-open state.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+  /jffs/addons/sockrocket/scripts/sockrocket.sh firewall-restore
+'
+
+    install_hook "/jffs/scripts/nat-start" \
+'# NAT rebuilds drop DNS redirects before the next watchdog pass.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && \
+  /jffs/addons/sockrocket/scripts/sockrocket.sh nat-restore
+'
+
+    install_hook "/jffs/scripts/services-start" \
+'# Boot checks the persistent Stop marker under the lifecycle lock.
+[ -x /jffs/addons/sockrocket/scripts/sockrocket.sh ] && /jffs/addons/sockrocket/scripts/sockrocket.sh boot
+'
+    install_wan_hooks
+    install_dns_postconf_hook
+
+    install_hook "/jffs/scripts/service-event" \
+'if [ "$1" = "restart" ] && [ "$2" = "Sockrocket" ]; then
+    /jffs/addons/sockrocket/scripts/sockrocket.sh restart
+fi
+'
+
+
+    # Post-install validation
+    info "Validating installation..."
+    errors=0
+    [ -x "$SOCKROCKET_BIN" ]                  || { warn "Binary not executable";       errors=$((errors+1)); }
+    [ -f "$SOCKROCKET_CONF" ]                 || { warn "Config file missing";         errors=$((errors+1)); }
+    [ -x "$SOCKROCKET_SCRIPTS/sockrocket.sh" ]      || { warn "sockrocket.sh not executable";       errors=$((errors+1)); }
+    [ -x "$SOCKROCKET_SCRIPTS/iptables.sh" ] || { warn "iptables.sh not executable";  errors=$((errors+1)); }
+    [ -s "$page" ]                                   || { warn "Web UI page missing";         errors=$((errors+1)); }
+    [ -x "$SOCKROCKET_DIR/sockrocket.cgi" ]         || { warn "CGI script not executable";   errors=$((errors+1)); }
+    [ "$errors" -eq 0 ] && ok "All files installed correctly" \
+                         || warn "$errors validation warning(s) — check output above"
+
+    post_install_start
+
+    echo ""
+    ok "Sockrocket installed successfully!"
+    echo ""
+    echo "  Config file : $SOCKROCKET_CONF"
+    echo "  Web UI      : http://router.asus.com/ext/sockrocket/sockrocket.asp"
+    echo ""
+    echo "  Start  : $SOCKROCKET_SCRIPTS/sockrocket.sh start"
+    echo "  Stop   : $SOCKROCKET_SCRIPTS/sockrocket.sh stop"
+    echo "  Status : $SOCKROCKET_SCRIPTS/sockrocket.sh status"
+    echo "  Update : sh $0 --update"
+    echo ""
+echo "Edit $SOCKROCKET_CONF to add your subscription or nodes, then start."
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+if [ "$KOOLSHARE" = "1" ]; then
+    ks_install
+else
+    merlin_install
+fi
