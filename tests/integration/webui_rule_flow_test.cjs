@@ -196,14 +196,14 @@ console.log('PASS: partially disabled groups expose only effective outlets; full
  assert.match(el('rule-flow').innerHTML,/<strong>影音网段<\/strong>/);
  assert.match(el('rule-flow-device').innerHTML,/客厅屏幕/);
  const stages=c.ruleFlowModel(rows,'rule',host).filter(s=>s.kind==='device_link');
- assert.deepEqual(Array.from(stages,s=>s.title),['Japan','Media']);
- assert.match(el('rule-flow').innerHTML,/<strong>Japan<\/strong><small>关联优先级 20/);
+ assert.deepEqual(Array.from(stages,s=>s.title),['Media','Japan'],'device links follow saved list order, not binding priority');
+ assert.match(el('rule-flow').innerHTML,/<strong>Japan<\/strong>/,'device-linked Japan group is drawn');
  c.SR_STATE.status.transparent_proxy=true;
  const reply=result(rows[1],{source:host});reply.trace.action='reject';reply.trace.steps[0].source=host;
  c.RULE_TRACE=reply;c.renderRuleFlow();
  assert.match(el('rule-flow').innerHTML,/class="map-node outlet selected"[^>]*><strong>拒绝/);
  refresh('');assert.match(el('rule-flow').innerHTML,/<strong>TV<\/strong>/);
- console.log('PASS: device priority, matching exit and refreshed device and subnet names on one graph');
+ console.log('PASS: device link order, matching exit and refreshed device and subnet names on one graph');
 }
 
 // Read the rendered wires and their endpoints independently of the flow model.
