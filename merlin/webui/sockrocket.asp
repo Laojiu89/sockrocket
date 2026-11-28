@@ -997,7 +997,7 @@ function apiXhr(action, data, cb, errCb, timeoutMs) {
   // must not escape uncaught.
   try {
     xhr.open('POST', '/cgi-bin/sockrocket.cgi?action=' + action, true);
-    xhr.overrideMimeType('application/json; charset=utf-8');
+    if (xhr.overrideMimeType) xhr.overrideMimeType('application/json; charset=utf-8');
     xhr.setRequestHeader('X-Sockrocket-Request', '1');
     xhr.setRequestHeader('Content-Type', 'application/json');
     xhr.timeout = timeoutMs || 15000;
@@ -1156,7 +1156,7 @@ function pollKscResult(seq, tries, cb, errCb, deadline) {
   }
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/_temp/sockrocket_rpc_' + seq + '.json?_=' + Math.random(), true);
-  xhr.overrideMimeType('application/json; charset=utf-8');
+  if (xhr.overrideMimeType) xhr.overrideMimeType('application/json; charset=utf-8');
   xhr.timeout = 5000;
   function retry() {
     setTimeout(function () { pollKscResult(seq, tries + 1, cb, errCb, deadline); }, 200);
