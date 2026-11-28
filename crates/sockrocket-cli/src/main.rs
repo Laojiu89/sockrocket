@@ -247,10 +247,13 @@ async fn async_main() -> Result<()> {
     if let Some(index) = args.iter().position(|arg| {
         matches!(
             arg.as_str(),
-            "--dump-rule-sources" | "--dump-rule-sources-v6"
+            "--dump-rule-sources"
+                | "--dump-rule-sources-v6"
+                | "--dump-cn-rule-sources"
+                | "--dump-cn-rule-sources-v6"
         )
     }) {
-        let ipv6 = args[index] == "--dump-rule-sources-v6";
+        let ipv6 = args[index].ends_with("-v6");
         let path = args
             .get(index + 1)
             .ok_or_else(|| anyhow::anyhow!("Config path required"))?;
