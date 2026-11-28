@@ -3894,13 +3894,13 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
       if(!members.has(name))members.set(name,[]);
       members.get(name).push(rule);
     });
-    var seenGroups={};
+    var seenGroups=new Set();
     (SR_STATE.deviceBindings||[]).filter(function(link){return applies(link.source);}).sort(function(a,b){
       var pa=sourceNetwork(a.source), pb=sourceNetwork(b.source);
       return (pb&&pb.prefix||0)-(pa&&pa.prefix||0);
     }).forEach(function(link){
       var gname=(link.group||'').trim();
-      if(seenGroups[gname])return; seenGroups[gname]=true;
+      if(seenGroups.has(gname))return; seenGroups.add(gname);
       group('device_link','设备关联组',(members.get(link.group)||[]).map(function(rule){
         return Object.assign({},rule,{source:link.source,target:link.target||rule.target});
       }));
