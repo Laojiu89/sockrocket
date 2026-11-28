@@ -162,7 +162,7 @@ CN_TABLES=iptables
 CN_FAMILY=inet
 CN_CHAIN=$MANGLE_CHAIN
 CN_DEST_FLAG=--dump-cn-cidrs
-CN_SOURCE_FLAG=--dump-rule-sources
+CN_SOURCE_FLAG=--dump-cn-rule-sources
 CN_FALLBACK=cn_via_tun
 
 # Select the IPv6 kernel objects only for this call. Both families use the
@@ -175,7 +175,7 @@ cn_ipv6() (
     CN_SOURCES=sockrocket_cn6_sources
     CN_FLOW=SOCKROCKET_CN6_FLOW
     CN_DEST_FLAG=--dump-cn-cidrs-v6
-    CN_SOURCE_FLAG=--dump-rule-sources-v6
+    CN_SOURCE_FLAG=--dump-cn-rule-sources-v6
     CN_FALLBACK=cn6_via_tun
     "$@"
 )

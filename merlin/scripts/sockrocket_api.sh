@@ -124,7 +124,7 @@ valid_staged_body() {
 }
 if [ -n "$staged" ]; then ENCODING=base64; fi
 case "$ACTION" in
-    add_rule|batch_add_rules|replace_rule_group|set_rule_group_enabled|delete_rule_group|add_node|import_nodes|save_config) requires_body=true ;;
+    add_rule|batch_add_rules|replace_rule_group|reorder_rule_groups|move_device_binding|set_rule_group_enabled|delete_rule_group|add_node|import_nodes|save_config) requires_body=true ;;
     *) requires_body=false ;;
 esac
 if [ -n "$staged" ] && ! valid_staged_body "$@"; then
