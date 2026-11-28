@@ -3491,10 +3491,8 @@ function ruleGroupRanks() {
   return groups;
 }
 function orderedRules(rules) {
-  var groups=ruleGroupRanks();
-  function rank(rule){return groups.get((rule.group||'').trim()) ?? Number.MAX_SAFE_INTEGER;}
   return rules.slice().sort(function(a,b){
-    return rulePhase(a)-rulePhase(b) || (isFinalRule(a)?0:rank(a)-rank(b)) || Number(a.index)-Number(b.index);
+    return rulePhase(a)-rulePhase(b) || Number(a.index)-Number(b.index);
   });
 }
 function orderedDeviceBindings(source) {
@@ -3896,7 +3894,13 @@ function ruleFlowModel(rows, mode, client, orderedRows, configuredOnly) {
       if(!members.has(name))members.set(name,[]);
       members.get(name).push(rule);
     });
-    (SR_STATE.deviceBindings||[]).filter(function(link){return applies(link.source);}).forEach(function(link){
+    var seenGroups={};
+    (SR_STATE.deviceBindings||[]).filter(function(link){return applies(link.source);}).sort(function(a,b){
+      var pa=sourceNetwork(a.source), pb=sourceNetwork(b.source);
+      return (pb&&pb.prefix||0)-(pa&&pa.prefix||0);
+    }).forEach(function(link){
+      var gname=(link.group||'').trim();
+      if(seenGroups[gname])return; seenGroups[gname]=true;
       group('device_link','设备关联组',(members.get(link.group)||[]).map(function(rule){
         return Object.assign({},rule,{source:link.source,target:link.target||rule.target});
       }));
