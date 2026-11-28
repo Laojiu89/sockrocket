@@ -230,11 +230,13 @@ printf 'ipv6_mode: dual_stack\ndns_hijack: true\ntransparent_proxy: true\nproxy_
 #!/bin/sh
 case "$1" in
     --refresh-device-ipv6) test ! -f "$0.fail-collect"; exit $? ;;
-    --dump-rule-sources-v6) printf '2001:db8:9::/64\n'; exit 0 ;;
+    --dump-rule-sources-v6|--dump-cn-rule-sources-v6) printf '2001:db8:9::/64\n'; exit 0 ;;
+    --dump-rule-sources|--dump-cn-rule-sources) printf '192.0.2.0/24\n'; exit 0 ;;
     --dump-cn-cidrs) printf '192.0.2.0/24\n'; exit 0 ;;
     --dump-cn-cidrs-v6) printf '2001:250::/30\n'; exit 0 ;;
     --supports-udp) exit 1 ;;
-    *) exit 0 ;;
+    --dump-proxy-endpoints) exit 0 ;;
+    *) echo "mock CLI: unknown argument $1" >&2; exit 2 ;;
 esac
 EOF
 chmod +x "$SOCKROCKET_DIR/sockrocket-cli"
