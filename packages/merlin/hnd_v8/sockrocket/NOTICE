@@ -1,0 +1,6 @@
+This custom build modifies Sockrocket v0.1.21 to add sortable rule groups,
+ordered rules and bindings, HTTP User-Agent routing, and IP-ASN routing.
+
+The embedded IP-to-ASN data is derived from the 2026-11-01 IPtoASN
+database (https://iptoasn.com/), published under the Public Domain
+Dedication and License (PDDL) v1.0.
